@@ -80,8 +80,10 @@ jobs:
         run: python -m ruff format --check ./benchtop ./omicsang scripts tests
       - name: Bandit
         run: python -m bandit -r ./benchtop ./omicsang -ll
-      - name: Audit resolved Python environment
-        run: python -m pip_audit --strict
+      - name: Audit resolved third-party Python environment
+        run: |
+          # OmicsANG comes from this checkout; every resolved third-party package stays strict.
+          python -m pip_audit --strict --requirement <(python -m pip freeze --exclude omicsang)
       - name: Shell syntax and static checks
         run: |
           bash -n bootstrap.sh
