@@ -24,11 +24,9 @@ reviewed dry-run, a real synthetic run, result inspection, and clean shutdown.
 [Security](SECURITY.md) ·
 [License](LICENSE)
 
-OmicsANG is source-available under the PolyForm Noncommercial License 1.0.0. It
-is not open-source software. This release is offered without a license fee only
-for uses permitted by that license. See
-[License and commercial use](#license-and-commercial-use) before using or
-redistributing it.
+OmicsANG is open-source software under the [MIT License](LICENSE), free to use,
+modify, and redistribute — including commercially. See [License](#license) for
+the details that still matter.
 
 ## Trust boundary
 
@@ -522,26 +520,17 @@ or exploit details in a public issue. Follow the private reporting route in
 [SECURITY.md](SECURITY.md). The current security contact is Anil Kumar Challagandla.
 No response time, remediation deadline, or compliance certification is promised.
 
-## License and commercial use
+## License
 
-OmicsANG is source-available under the
-[PolyForm Noncommercial License 1.0.0](LICENSE). This release is offered without
-a license fee for uses that license permits. The license permits any
-noncommercial purpose, specified personal uses without anticipated commercial
-application, and use by the organizations it lists, including educational
-institutions and public research organizations. It does not grant commercial-use
-rights. Commercial freelance, consulting, internal business, hosted, or other
-commercial use requires a separate written commercial license. If a planned use
-is commercial or the boundary is unclear, request a written license through the
-contact route in
-[COMMERCIAL-LICENSING.md](COMMERCIAL-LICENSING.md):
-[challagandla.anil@gmail.com](mailto:challagandla.anil@gmail.com).
+OmicsANG is licensed under the [MIT License](LICENSE). You may use, copy,
+modify, and redistribute it, for commercial or noncommercial purposes, provided
+the copyright notice and permission notice are retained. It is offered as-is,
+without warranty or liability — see `LICENSE` for the operative wording.
 
-`COMMERCIAL-LICENSING.md` is informational and does not grant a license or
-modify `LICENSE`. Third-party dependencies and vendored browser components
-remain under their own licenses and notices; see `THIRD_PARTY_NOTICES.md`.
-Future releases, support, or hosted offerings may have different terms or
-pricing. The `LICENSE` file shipped with each release controls that release.
+Third-party dependencies and vendored browser components remain under their own
+licenses and notices; the MIT grant here does not replace those terms. See
+`THIRD_PARTY_NOTICES.md`. The `LICENSE` file shipped with each release controls
+that release.
 
 ## Feedback and contributions
 

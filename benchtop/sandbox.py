@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Kernel-enforced OS containment for agent sessions.
 
 OmicsANG already refuses to hand an agent the server's whole environment

@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 include README.md
 include LICENSE
-include COMMERCIAL-LICENSING.md
 include THIRD_PARTY_NOTICES.md
 include SECURITY.md
 include environment.yml

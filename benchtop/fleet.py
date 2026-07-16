@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Fleet jobs — one AI task fanned out across many pipelines at once.
 
 A job holds a one-way prompt digest, tool metadata, and one *target* per

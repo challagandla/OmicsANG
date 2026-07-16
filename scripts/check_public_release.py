@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Fail closed when public-release metadata is incomplete or checkout-specific.
 
 This check intentionally uses only the Python standard library.  It is designed
@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10 CI
     tomllib = None  # type: ignore[assignment]
 
 
-EXPECTED_LICENSE_ID = "PolyForm-Noncommercial-1.0.0"
+EXPECTED_LICENSE_ID = "MIT"
 EXPECTED_DISTRIBUTION_NAME = "omicsang"
 IMPLEMENTATION_PACKAGE = "bench" + "top"
 EXPECTED_CONSOLE_SCRIPTS = {
@@ -35,10 +35,10 @@ EXPECTED_PACKAGES = {IMPLEMENTATION_PACKAGE, "omicsang"}
 PUBLIC_DOCUMENTS = (
     "README.md",
     "LICENSE",
-    "COMMERCIAL-LICENSING.md",
     "SECURITY.md",
     "THIRD_PARTY_NOTICES.md",
     "docs/BEGINNER_TUTORIAL.md",
+    "docs/agent-sandbox.md",
     "docs/assets/omicsang-journey.svg",
     "docs/assets/omicsang-workspace-map.svg",
 )

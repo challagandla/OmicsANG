@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Bio-specific QC parsers — turn the artifacts pipelines already emit into
 per-sample summary tables for the Results tab.
 

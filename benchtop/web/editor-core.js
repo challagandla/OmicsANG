@@ -1,5 +1,5 @@
 /* SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla */
-/* SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 */
+/* SPDX-License-Identifier: MIT */
 /* Dependency-free editing primitives shared by the OmicsANG browser editor and tests. */
 (function exposeEditorCore(root, factory) {
   'use strict';

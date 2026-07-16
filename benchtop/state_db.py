@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Durable SQLite state for OmicsANG jobs, events, and user configuration.
 
 The database is the control-plane source of truth.  Live PTY file descriptors

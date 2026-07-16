@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Pipeline discovery + Snakemake command construction.
 
 Scans the root directory for pipeline repos and figures out, per repo:

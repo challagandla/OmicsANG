@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 # Create or update the local OmicsANG environment, then launch the installed CLI.
 set -Eeuo pipefail
 IFS=$'\n\t'

@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Security regression tests for OmicsANG's local control plane.
 
 These tests deliberately avoid the owner's real repositories, credentials, and

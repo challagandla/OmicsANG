@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Local, original help content and dependency hints for the browser UI.
 
 This module deliberately performs no network requests.  Documentation URLs are

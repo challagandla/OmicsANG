@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Focused tests for the tagged public-release metadata gate."""
 
 from __future__ import annotations
@@ -26,10 +26,10 @@ def _write(root: Path, relative: str, text: str = "published\n") -> None:
 def _release_tree(root: Path) -> Path:
     for document in (
         "README.md",
-        "COMMERCIAL-LICENSING.md",
         "SECURITY.md",
         "THIRD_PARTY_NOTICES.md",
         "docs/BEGINNER_TUTORIAL.md",
+        "docs/agent-sandbox.md",
         "docs/assets/omicsang-journey.svg",
         "docs/assets/omicsang-workspace-map.svg",
     ):
@@ -37,7 +37,7 @@ def _release_tree(root: Path) -> Path:
     _write(
         root,
         "LICENSE",
-        "# PolyForm Noncommercial License 1.0.0\n\nRequired Notice: Copyright 2026 Example\n",
+        "MIT License\n\nCopyright (c) 2026 Example\n",
     )
     _write(root, "benchtop/web/vendor/xterm/5.3.0/LICENSE", "MIT License\n")
     _write(
@@ -50,7 +50,7 @@ def _release_tree(root: Path) -> Path:
         "pyproject.toml",
         """[project]
 name = "omicsang"
-license = "PolyForm-Noncommercial-1.0.0"
+license = "MIT"
 license-files = [
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
@@ -69,10 +69,10 @@ packages = ["benchtop", "omicsang"]
         "MANIFEST.in",
         """include README.md
 include LICENSE
-include COMMERCIAL-LICENSING.md
 include THIRD_PARTY_NOTICES.md
 include SECURITY.md
 include docs/BEGINNER_TUTORIAL.md
+include docs/agent-sandbox.md
 recursive-include docs/assets *.svg
 recursive-include benchtop/web *
 recursive-include omicsang *.py
@@ -122,7 +122,7 @@ def test_gate_reports_all_publication_blocker_categories(tmp_path: Path) -> None
         "pyproject.toml",
         """[project]
 name = "benchtop"
-license = "MIT"
+license = "Apache-2.0"
 license-files = ["LICENSE"]
 """,
     )
@@ -212,10 +212,10 @@ def test_manifest_must_package_each_public_document_and_vendor_license(
 
     assert {finding.message.rsplit(": ", 1)[-1] for finding in omissions} == {
         "LICENSE",
-        "COMMERCIAL-LICENSING.md",
         "SECURITY.md",
         "THIRD_PARTY_NOTICES.md",
         "docs/BEGINNER_TUTORIAL.md",
+        "docs/agent-sandbox.md",
         "docs/assets/omicsang-journey.svg",
         "docs/assets/omicsang-workspace-map.svg",
         "benchtop/web/vendor/xterm/5.3.0/LICENSE",
@@ -327,7 +327,7 @@ def test_distribution_scripts_and_both_packages_are_required(tmp_path: Path) -> 
         "pyproject.toml",
         """[project]
 name = "not-omicsang"
-license = "PolyForm-Noncommercial-1.0.0"
+license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 
 [project.scripts]
