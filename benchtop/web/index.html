@@ -1,0 +1,84 @@
+<!-- SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla -->
+<!-- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="OmicsANG — All your omics. One workspace." />
+  <title>OmicsANG · All your omics. One workspace.</title>
+  <script src="/auth-bootstrap.js?v=20260716-restore"></script>
+  <link rel="stylesheet" href="/vendor/xterm/5.3.0/xterm.css" />
+  <link rel="stylesheet" href="/styles.css?v=20260716-restore" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand" aria-label="OmicsANG — All your omics. One workspace.">
+      <span class="brand-mark" aria-hidden="true">⌬</span>
+      <span class="brand-copy">
+        <strong>OmicsANG</strong>
+        <span class="brand-tagline">All your omics. One workspace.</span>
+      </span>
+    </div>
+    <div id="root-label" class="muted"></div>
+    <div id="session-chips" class="chips"></div>
+    <div id="tool-badges" class="badges"></div>
+    <button id="cmdk-button" class="top-action" type="button">⌘K</button>
+    <button id="help-toggle" class="top-action" type="button" aria-controls="help-drawer" aria-expanded="false">Help</button>
+    <button id="view-settings-toggle" class="top-action" type="button">View</button>
+    <button id="sidebar-toggle" class="top-action" type="button" aria-controls="sidebar" aria-expanded="true" data-panel-pref="sidebarOpen" data-panel-label="pipelines">Pipelines</button>
+    <button id="monitor-toggle" class="top-action" type="button" aria-controls="monitor-panel" aria-expanded="true" data-panel-pref="monitorOpen" data-panel-label="run monitor">Monitor</button>
+  </header>
+
+  <div id="layout">
+    <aside id="sidebar">
+      <div class="side-head">
+        <span>Pipelines <span id="pipe-count" class="pill"></span></span>
+        <button id="sidebar-collapse" class="ghost sm icon-only panel-collapse" type="button" aria-controls="sidebar" aria-expanded="true" aria-label="Hide pipelines" data-panel-pref="sidebarOpen" data-panel-label="pipelines">‹</button>
+      </div>
+      <label class="pipeline-filter">
+        <span class="sr-only">Find a registered pipeline</span>
+        <input id="pipeline-filter" type="search" placeholder="Find pipeline" autocomplete="off" spellcheck="false" />
+      </label>
+      <ul id="pipeline-list"></ul>
+    </aside>
+
+    <main id="main">
+      <nav id="tabs" aria-label="Pipeline workspace"></nav>
+      <section id="view" role="region" tabindex="0" aria-labelledby="active-view-title"></section>
+    </main>
+  </div>
+
+  <!-- terminals live here permanently; shown/hidden so sessions survive tab switches -->
+  <div id="terminal-dock" class="hidden"></div>
+  <aside id="monitor-panel" class="monitor-panel" tabindex="-1"></aside>
+  <div id="panel-restore-dock" class="panel-restore-dock hidden" role="group" aria-label="Restore hidden panels">
+    <span class="panel-restore-caption" aria-hidden="true">Hidden panels</span>
+    <button id="sidebar-restore" class="panel-restore-button hidden" type="button" aria-controls="sidebar" aria-expanded="false" data-panel-restore="sidebarOpen" data-panel-label="pipelines">
+      <span class="panel-restore-symbol panel-restore-symbol-left" aria-hidden="true"></span><span>Pipelines</span>
+    </button>
+    <button id="monitor-restore" class="panel-restore-button hidden" type="button" aria-controls="monitor-panel" aria-expanded="false" data-panel-restore="monitorOpen" data-panel-label="run monitor">
+      <span class="panel-restore-symbol panel-restore-symbol-right" aria-hidden="true"></span><span>Monitor</span>
+    </button>
+    <button id="code-sidebar-restore" class="panel-restore-button hidden" type="button" aria-expanded="false" data-panel-restore="codeSidebarOpen" data-panel-label="file tree">
+      <span class="panel-restore-symbol panel-restore-symbol-left" aria-hidden="true"></span><span>Files</span>
+    </button>
+    <button id="code-assistant-restore" class="panel-restore-button hidden" type="button" aria-expanded="false" data-panel-restore="codeAssistantOpen" data-panel-label="assistant">
+      <span class="panel-restore-symbol panel-restore-symbol-right" aria-hidden="true"></span><span>Assistant</span>
+    </button>
+    <button id="terminal-restore" class="panel-restore-button hidden" type="button" aria-expanded="false" data-panel-restore="terminalOpen" data-panel-label="terminal">
+      <span class="panel-restore-symbol panel-restore-symbol-bottom" aria-hidden="true"></span><span>Terminal</span>
+    </button>
+  </div>
+  <div id="view-settings" class="view-settings hidden"></div>
+  <div id="command-palette" class="cmdk hidden"></div>
+  <div id="lightbox" class="lightbox hidden"></div>
+  <div id="help-backdrop" class="help-backdrop hidden"></div>
+  <aside id="help-drawer" class="help-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="help-title"></aside>
+
+  <script src="/vendor/xterm/5.3.0/xterm.js"></script>
+  <script src="/vendor/xterm-addon-fit/0.8.0/xterm-addon-fit.js"></script>
+  <script src="/editor-core.js?v=20260716-restore"></script>
+  <script src="/app.js?v=20260716-restore"></script>
+</body>
+</html>

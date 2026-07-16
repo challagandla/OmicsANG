@@ -1,0 +1,271 @@
+# SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: "3.10"
+          - os: ubuntu-24.04
+            python: "3.11"
+          - os: ubuntu-24.04
+            python: "3.12"
+          - os: ubuntu-24.04
+            python: "3.13"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install OmicsANG and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+      - name: Run tests with coverage
+        run: |
+          python -m coverage run -m pytest
+          python -m coverage report
+
+  quality:
+    name: Static and dependency checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install OmicsANG and quality tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+      - name: Ruff lint
+        run: python -m ruff check ./benchtop ./omicsang scripts tests
+      - name: Ruff format
+        run: python -m ruff format --check ./benchtop ./omicsang scripts tests
+      - name: Bandit
+        run: python -m bandit -r ./benchtop ./omicsang -ll
+      - name: Audit resolved Python environment
+        run: python -m pip_audit --strict
+      - name: Shell syntax and static checks
+        run: |
+          bash -n bootstrap.sh
+          shellcheck bootstrap.sh
+      - name: JavaScript syntax
+        run: |
+          node --check benchtop/web/auth-bootstrap.js
+          node --check benchtop/web/editor-core.js
+          node --check benchtop/web/app.js
+      - name: Secret scan (controlled fixture directory excluded)
+        run: |
+          detect-secrets scan --all-files --no-verify --exclude-files '(^|/)(benchtop/web/vendor|tests)(/|$)' > "${RUNNER_TEMP}/detect-secrets.json"
+          python -c 'import json,sys; data=json.load(open(sys.argv[1], encoding="utf-8")); findings=sum(map(len, data["results"].values())); raise SystemExit(f"secret scanner found {findings} candidate(s)" if findings else 0)' "${RUNNER_TEMP}/detect-secrets.json"
+      - name: Verify vendored browser assets
+        run: |
+          printf '%s  %s\n' \
+            f0aea0f75f48559013ae6643c2479dd737d26da42d5524e6d2b70915ae6523c7 benchtop/web/vendor/xterm/5.3.0/xterm.js \
+            832f3f2c603b43ad4351ff04970150cc7a873014276db126a6065c6dd81e4872 benchtop/web/vendor/xterm/5.3.0/xterm.css \
+            10f3194c5f17c1786fb7d5db865c1ec8539b6736a318063fd38bdaaf7c46848f benchtop/web/vendor/xterm-addon-fit/0.8.0/xterm-addon-fit.js \
+            | sha256sum --check -
+      - name: Generate and validate a private CI SBOM
+        run: |
+          cyclonedx-py environment --pyproject pyproject.toml --output-reproducible --of JSON -o "${RUNNER_TEMP}/omicsang-sbom.cdx.json" "$(command -v python)"
+          python -c 'import json,sys; data=json.load(open(sys.argv[1], encoding="utf-8")); assert data.get("bomFormat") == "CycloneDX"; assert data.get("components")' "${RUNNER_TEMP}/omicsang-sbom.cdx.json"
+
+  package:
+    name: Build and inspect distributions
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install build validation tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+      - name: Enforce public-release metadata
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python scripts/check_public_release.py
+      - name: Verify release tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          python - <<'PY'
+          import os
+          from omicsang import __version__
+
+          expected = f"v{__version__}"
+          actual = os.environ["GITHUB_REF_NAME"]
+          if actual != expected:
+              raise SystemExit(f"release tag {actual!r} does not match {expected!r}")
+          PY
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Validate metadata and manifests
+        run: |
+          python -m twine check dist/*
+          check-manifest
+          check-wheel-contents dist/*.whl
+      - name: Inspect archive contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          from zipfile import ZipFile
+
+          expected_artifacts = {
+              "omicsang-0.2.1-py3-none-any.whl",
+              "omicsang-0.2.1.tar.gz",
+          }
+          artifacts = {path.name for path in Path("dist").iterdir() if path.is_file()}
+          if artifacts != expected_artifacts:
+              raise SystemExit(
+                  f"expected OmicsANG 0.2.1 artifacts {sorted(expected_artifacts)}; "
+                  f"found {sorted(artifacts)}"
+              )
+
+          wheel = Path("dist/omicsang-0.2.1-py3-none-any.whl")
+          with ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+          required = {
+              "omicsang/__init__.py",
+              "omicsang/__main__.py",
+              "benchtop/web/auth-bootstrap.js",
+              "benchtop/web/app.js",
+              "benchtop/web/editor-core.js",
+              "benchtop/web/index.html",
+              "benchtop/web/styles.css",
+              "benchtop/web/vendor/xterm/5.3.0/xterm.js",
+              "benchtop/web/vendor/xterm/5.3.0/xterm.css",
+              "benchtop/web/vendor/xterm-addon-fit/0.8.0/xterm-addon-fit.js",
+          }
+          missing = sorted(required - names)
+          forbidden = sorted(
+              name for name in names
+              if any(part in name.lower() for part in (
+                  "instruction.md", "handoff", ".claude", ".codex", "__pycache__"
+              )) or name.endswith((".pyc", ".map"))
+          )
+          if missing or forbidden:
+              raise SystemExit(f"missing={missing}; forbidden={forbidden}")
+          print(f"validated {len(names)} wheel members")
+
+          sdist = Path("dist/omicsang-0.2.1.tar.gz")
+          with tarfile.open(sdist, "r:gz") as archive:
+              source_names = {member.name for member in archive.getmembers() if member.isfile()}
+          required_suffixes = {
+              "/LICENSE",
+              "/README.md",
+              "/SECURITY.md",
+              "/THIRD_PARTY_NOTICES.md",
+              "/docs/BEGINNER_TUTORIAL.md",
+              "/docs/assets/omicsang-journey.svg",
+              "/docs/assets/omicsang-workspace-map.svg",
+              "/omicsang/__init__.py",
+              "/omicsang/__main__.py",
+              "/benchtop/web/app.js",
+              "/benchtop/web/auth-bootstrap.js",
+              "/benchtop/web/editor-core.js",
+              "/benchtop/web/vendor/xterm/5.3.0/xterm.js",
+              "/examples/demo-pipeline/Snakefile",
+          }
+          missing_source = sorted(
+              suffix for suffix in required_suffixes
+              if not any(name.endswith(suffix) for name in source_names)
+          )
+          forbidden_source = sorted(
+              name for name in source_names
+              if any(part in name.lower() for part in (
+                  "instruction.md", "handoff", ".claude", ".codex", "__pycache__"
+              )) or name.endswith((".pyc", ".map"))
+          )
+          if missing_source or forbidden_source:
+              raise SystemExit(
+                  f"sdist missing={missing_source}; forbidden={forbidden_source}"
+              )
+          print(f"validated {len(source_names)} sdist file members")
+          PY
+      - name: Install and inspect wheel outside the checkout
+        run: |
+          wheel="dist/omicsang-0.2.1-py3-none-any.whl"
+          python -m venv "${RUNNER_TEMP}/omicsang-wheel"
+          "${RUNNER_TEMP}/omicsang-wheel/bin/python" -m pip install "${wheel}"
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/omicsang-wheel/bin/python" - <<'PY'
+          from importlib.metadata import version
+          from importlib.resources import files
+
+          import omicsang
+          import benchtop.server
+
+          assert omicsang.__version__ == "0.2.1"
+          assert version("omicsang") == "0.2.1"
+          web = files(benchtop.server.__package__).joinpath("web")
+          for relative in ("index.html", "app.js", "editor-core.js", "styles.css"):
+              assert web.joinpath(relative).is_file(), relative
+          print("installed server and static resources are importable")
+          PY
+          "${RUNNER_TEMP}/omicsang-wheel/bin/omicsang" --help
+          "${RUNNER_TEMP}/omicsang-wheel/bin/omicsang" --version
+          "${RUNNER_TEMP}/omicsang-wheel/bin/python" -m omicsang --version
+          "${RUNNER_TEMP}/omicsang-wheel/bin/benchtop" --help
+          "${RUNNER_TEMP}/omicsang-wheel/bin/benchtop" --version
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          languages: python,javascript-typescript
+      - name: Analyze
+        uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0

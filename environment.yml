@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+name: omicsang
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - .

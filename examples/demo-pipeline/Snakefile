@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+from pathlib import Path
+
+
+configfile: "config/config.yaml"
+
+
+rule all:
+    input:
+        config["output"]
+
+
+rule summarize_synthetic_values:
+    input:
+        samples=config["samples"]
+    output:
+        report=config["output"]
+    run:
+        lines = Path(input.samples).read_text(encoding="utf-8").splitlines()
+        header = lines[0].split("\t")
+        rows = [dict(zip(header, line.split("\t"))) for line in lines[1:] if line]
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row["condition"], []).append(int(row["synthetic_value"]))
+        summary = ["condition\tsample_count\tmean_synthetic_value"]
+        for condition in sorted(grouped):
+            values = grouped[condition]
+            summary.append(f"{condition}\t{len(values)}\t{sum(values) / len(values):.1f}")
+        Path(output.report).write_text("\n".join(summary) + "\n", encoding="utf-8")

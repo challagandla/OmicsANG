@@ -1,0 +1,5 @@
+sample	condition	batch	synthetic_value
+control_a	control	batch_1	10
+control_b	control	batch_2	12
+treated_a	treated	batch_1	18
+treated_b	treated	batch_2	20

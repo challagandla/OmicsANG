@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+samples: data/samples.tsv
+output: results/synthetic-summary.tsv

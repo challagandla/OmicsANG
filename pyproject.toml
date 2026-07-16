@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+[build-system]
+requires = ["setuptools>=83,<84"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omicsang"
+dynamic = ["version"]
+description = "All your omics. One workspace."
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10,<3.14"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: FastAPI",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "fastapi>=0.110,<1",
+    "uvicorn>=0.29,<1",
+    "PyYAML>=6,<7",
+    "ruamel.yaml>=0.17,<0.20",
+    "websockets>=12,<17",
+]
+
+[project.urls]
+Homepage = "https://github.com/challagandla/OmicsANG"
+Documentation = "https://github.com/challagandla/OmicsANG/blob/main/docs/BEGINNER_TUTORIAL.md"
+Source = "https://github.com/challagandla/OmicsANG"
+Issues = "https://github.com/challagandla/OmicsANG/issues"
+Security = "https://github.com/challagandla/OmicsANG/blob/main/SECURITY.md"
+
+[project.optional-dependencies]
+dev = [
+    "bandit[toml]>=1.8,<2",
+    "build>=1.2,<2",
+    "check-manifest>=0.50,<1",
+    "check-wheel-contents>=0.6,<1",
+    "coverage[toml]>=7.6,<8",
+    "cyclonedx-bom>=5,<8",
+    "detect-secrets>=1.5,<2",
+    "mypy>=1.13,<3",
+    "pip-audit>=2.7,<3",
+    "pytest>=8.3,<10",
+    "ruff>=0.9,<1",
+    "setuptools>=83,<84",
+    "twine>=5.1,<7",
+]
+
+[project.scripts]
+omicsang = "benchtop.__main__:main"
+benchtop = "benchtop.__main__:main"
+
+[tool.setuptools]
+include-package-data = false
+packages = ["benchtop", "omicsang"]
+
+[tool.setuptools.dynamic]
+version = { attr = "benchtop.__version__" }
+
+[tool.setuptools.package-data]
+benchtop = ["web/*", "web/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["benchtop", "omicsang"]
+
+[tool.coverage.report]
+fail_under = 35
+show_missing = true
+skip_covered = true
+
+[tool.check-manifest]
+ignore = [".github/**", ".gitignore"]
+
+[tool.check-wheel-contents]
+# The public shim and the compatibility implementation are both intentional.
+# Declaring them enables exact W201/W202 checks instead of the generic W009.
+toplevel = ["benchtop", "omicsang"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
