@@ -47,11 +47,11 @@ class FrontendSecurityContractTests(unittest.TestCase):
         self.assertIn("j.benchtop_owned", self.source)
 
     def test_bootstrap_fragment_is_cleared_before_vendor_scripts(self) -> None:
-        auth_position = self.index_source.index('/auth-bootstrap.js?v=20260716-restore')
+        auth_position = self.index_source.index("/auth-bootstrap.js?v=20260716-restore")
         xterm_position = self.index_source.index(
             '<script src="/vendor/xterm/5.3.0/xterm.js">'
         )
-        app_position = self.index_source.index('/app.js?v=20260716-restore')
+        app_position = self.index_source.index("/app.js?v=20260716-restore")
         self.assertLess(auth_position, xterm_position)
         self.assertLess(auth_position, app_position)
         self.assertIn("window.history.replaceState(", self.auth_source)
@@ -132,7 +132,9 @@ class FrontendSecurityContractTests(unittest.TestCase):
         self.assertIn('id="sidebar-collapse"', self.index_source)
         self.assertIn('class="ghost sm icon-only panel-collapse"', self.index_source)
         self.assertIn('id="panel-restore-dock"', self.index_source)
-        self.assertIn('role="group" aria-label="Restore hidden panels"', self.index_source)
+        self.assertIn(
+            'role="group" aria-label="Restore hidden panels"', self.index_source
+        )
         for restore_id, key, label in (
             ("sidebar-restore", "sidebarOpen", "pipelines"),
             ("monitor-restore", "monitorOpen", "run monitor"),
@@ -145,12 +147,14 @@ class FrontendSecurityContractTests(unittest.TestCase):
             self.assertIn(f'data-panel-label="{label}"', self.index_source)
         self.assertGreater(
             self.index_source.index('id="panel-restore-dock"'),
-            self.index_source.index('</aside>', self.index_source.index('id="sidebar"')),
+            self.index_source.index(
+                "</aside>", self.index_source.index('id="sidebar"')
+            ),
         )
         self.assertGreater(
             self.index_source.index('id="panel-restore-dock"'),
             self.index_source.index(
-                '</aside>', self.index_source.index('id="monitor-panel"')
+                "</aside>", self.index_source.index('id="monitor-panel"')
             ),
         )
         self.assertIn("sidebar.classList.toggle('hidden', !p.sidebarOpen)", self.source)
@@ -160,16 +164,32 @@ class FrontendSecurityContractTests(unittest.TestCase):
         self.assertIn("'data-panel-pref': 'terminalOpen'", self.source)
         self.assertIn("stage.classList.toggle('hidden', !p.terminalOpen)", self.source)
         self.assertIn("button.setAttribute('aria-label'", self.source)
-        self.assertIn("function syncPanelRestoreDock(preferences = state.uiPrefs)", self.source)
+        self.assertIn(
+            "function syncPanelRestoreDock(preferences = state.uiPrefs)", self.source
+        )
         self.assertIn("syncPanelRestoreDock(p);", self.source)
         self.assertIn("function focusRestoredPanel(key)", self.source)
-        self.assertIn("requestAnimationFrame(() => focusRestoredPanel(key))", self.source)
-        self.assertIn("requestAnimationFrame(() => $('#sidebar-restore').focus())", self.source)
-        self.assertIn("requestAnimationFrame(() => $('#monitor-restore').focus())", self.source)
-        self.assertIn("requestAnimationFrame(() => $('#code-sidebar-restore').focus())", self.source)
-        self.assertIn("requestAnimationFrame(() => $('#code-assistant-restore').focus())", self.source)
+        self.assertIn(
+            "requestAnimationFrame(() => focusRestoredPanel(key))", self.source
+        )
+        self.assertIn(
+            "requestAnimationFrame(() => $('#sidebar-restore').focus())", self.source
+        )
+        self.assertIn(
+            "requestAnimationFrame(() => $('#monitor-restore').focus())", self.source
+        )
+        self.assertIn(
+            "requestAnimationFrame(() => $('#code-sidebar-restore').focus())",
+            self.source,
+        )
+        self.assertIn(
+            "requestAnimationFrame(() => $('#code-assistant-restore').focus())",
+            self.source,
+        )
         self.assertIn("fitTerminal(state.focusedSession)", self.source)
-        self.assertIn("document.body.classList.toggle('panel-restore-visible'", self.source)
+        self.assertIn(
+            "document.body.classList.toggle('panel-restore-visible'", self.source
+        )
         self.assertIn('class="monitor-panel" tabindex="-1"', self.index_source)
         self.assertIn("'Collapse folders'", self.source)
         self.assertNotIn("'Collapse all'", self.source)
@@ -182,7 +202,9 @@ class FrontendSecurityContractTests(unittest.TestCase):
         self.assertIn(".panel-restore-symbol-right::before", self.styles_source)
         self.assertIn(".panel-restore-symbol-bottom::before", self.styles_source)
         self.assertIn("body.panel-restore-visible #view", self.styles_source)
-        self.assertIn("body.panel-restore-visible #view .term-mount", self.styles_source)
+        self.assertIn(
+            "body.panel-restore-visible #view .term-mount", self.styles_source
+        )
         self.assertIn("min-height: 44px", self.styles_source)
         self.assertIn("body.monitor-open .panel-restore-dock", self.styles_source)
         self.assertIn("@media (prefers-reduced-motion: reduce)", self.styles_source)

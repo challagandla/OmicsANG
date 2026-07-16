@@ -19,8 +19,8 @@ class EditorAssetContractTests(unittest.TestCase):
     def test_editor_core_loads_before_the_application(self) -> None:
         source = INDEX_HTML.read_text(encoding="utf-8")
         self.assertLess(
-            source.index('/editor-core.js?v=20260716-restore'),
-            source.index('/app.js?v=20260716-restore'),
+            source.index("/editor-core.js?v=20260716-restore"),
+            source.index("/app.js?v=20260716-restore"),
         )
         self.assertIn("window.OmicsEditorCore", APP_JS.read_text(encoding="utf-8"))
 
