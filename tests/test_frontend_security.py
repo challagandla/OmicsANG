@@ -261,9 +261,12 @@ class FrontendSecurityContractTests(unittest.TestCase):
         self.assertIn("function agentDisclosure(context = '')", self.source)
         self.assertIn("Agent access & privacy · approval required", self.source)
         self.assertIn("does not launch a tool or supply context until", self.source)
-        self.assertIn("OmicsANG does not add an OS sandbox", self.source)
+        # Containment is disclosed, and so is the limit that matters: it stops
+        # disk reads, not disclosure to the provider.
+        self.assertIn("contains the selected CLI to the repository", self.source)
+        self.assertIn("Containment does not limit the network", self.source)
         self.assertIn("provider-specific environment allowlist", self.source)
-        self.assertIn("Environment filtering does not limit", self.source)
+        self.assertIn("limits what an agent may disclose", self.source)
         self.assertIn("Review before launch", self.source)
         self.assertIn("acknowledge_external_agent: true", self.source)
         self.assertNotIn("class: 'agent-warning'", self.source)

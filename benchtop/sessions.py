@@ -34,6 +34,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import sandbox
 from .runplan import redact_argv, redact_mapping
 
 # Sentinel pushed onto subscriber queues when a session ends.
@@ -146,6 +147,44 @@ def _child_environment(
     return {key: combined[key] for key in allowed if key in combined}
 
 
+def _child_argv(
+    kind: str,
+    argv: list[str],
+    *,
+    cwd: str,
+    tool: str,
+) -> tuple[list[str], str]:
+    """Return the argv to exec plus a scrollback note describing containment.
+
+    The environment boundary above stops an agent *inheriting* the server's
+    secrets; this one stops it *reading* the rest of the disk.  Only the
+    external provider CLIs are contained: a `shell` session is the operator's
+    own terminal, not an external agent, and keeps the historical behaviour.
+
+    Containment wraps the command rather than replacing `Session.argv`, so the
+    UI, redaction, and durable job payloads still describe the real agent
+    command instead of the sandbox helper.
+    """
+    if kind != "agent" or tool not in _AGENT_PROVIDER_ENV:
+        return list(argv), ""
+    policy = sandbox.mode()
+    if policy == sandbox.MODE_OFF:
+        return list(argv), (
+            "OmicsANG: agent NOT contained (OMICSANG_AGENT_SANDBOX=off) — "
+            "it runs with your full OS permissions"
+        )
+    try:
+        wrapped = sandbox.build_argv(list(argv), cwd=cwd, tool=tool)
+    except sandbox.SandboxUnavailable as exc:
+        if policy == sandbox.MODE_REQUIRE:
+            raise RuntimeError(f"agent containment is required but unavailable: {exc}")
+        return list(argv), (
+            f"OmicsANG: agent NOT contained ({exc}) — it runs with your full OS "
+            "permissions; set OMICSANG_AGENT_SANDBOX=require to refuse instead"
+        )
+    return wrapped, sandbox.describe(cwd, tool)
+
+
 class Session:
     def __init__(
         self,
@@ -214,6 +253,17 @@ class Session:
         env.setdefault("TERM", "xterm-256color")
         env.setdefault("FORCE_COLOR", "1")
 
+        # Resolve containment before the fork so an unsatisfiable policy is
+        # reported to the caller instead of dying inside an orphaned child.
+        exec_argv, containment_note = _child_argv(
+            self.kind,
+            self.argv,
+            cwd=self.cwd,
+            tool=str(self.meta.get("tool") or ""),
+        )
+        if containment_note:
+            self.note(containment_note)
+
         pid, fd = pty.fork()
         if pid == 0:  # ---- child ----
             try:
@@ -222,7 +272,7 @@ class Session:
                 os.write(2, f"OmicsANG: cannot enter {self.cwd!r}: {exc}\n".encode())
                 os._exit(126)
             try:
-                os.execvpe(self.argv[0], self.argv, env)
+                os.execvpe(exec_argv[0], exec_argv, env)
             except Exception as exc:  # pragma: no cover - exec failure path
                 os.write(2, f"OmicsANG: cannot exec {self.argv!r}: {exc}\n".encode())
                 os._exit(127)

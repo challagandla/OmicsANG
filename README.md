@@ -33,12 +33,15 @@ redistributing it.
 ## Trust boundary
 
 OmicsANG is for one trusted local user working with trusted local repositories.
-It is not a sandbox, remote service, multi-user service, or clinical diagnostic
-system. It refuses non-loopback bind addresses and must not be exposed through a
-network, reverse proxy, port-forward, or shared host.
+It is not a remote service, multi-user service, or clinical diagnostic system. It
+refuses non-loopback bind addresses and must not be exposed through a network,
+reverse proxy, port-forward, or shared host.
 
-Pipeline commands, shells, and agents execute with your OS account's permissions.
-They can read or change anything that account can access. Repository output,
+Pipeline commands and shells execute with your OS account's permissions and can
+read or change anything that account can access. External agent CLIs are
+contained to the repository they were launched against — see
+[docs/agent-sandbox.md](docs/agent-sandbox.md) for the boundary and its limits,
+notably that it restricts disk reads rather than network egress. Repository output,
 terminal logs, and OmicsANG state may contain genomic, clinical, personal, or
 confidential information. External agents may send prompts, repository context,
 selected code, and logs to their providers under your account configuration and
