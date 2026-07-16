@@ -369,7 +369,7 @@ function confirmAgentLaunch(tool, context = '') {
   const name = tool === 'claude' ? 'Claude Code' : tool === 'codex' ? 'Codex' : 'Shell';
   const permissions = tool === 'shell'
     ? 'The shell runs as your OS account and can read or change anything that account can access.'
-    : `${name} runs as your OS account; OmicsANG does not add an OS sandbox to the selected CLI.`;
+    : `${name} is contained to this repository and its own provider configuration; your home directory and other pipelines are not visible to it.`;
   const transmission = tool === 'shell'
     ? 'OmicsANG does not send shell input to an agent provider; commands or shell startup configuration may use the network.'
     : 'The prepared prompt and repository content the CLI reads may be transmitted to its external provider under that tool\'s configuration and terms.';
@@ -388,8 +388,8 @@ function agentDisclosure(context = '') {
     el('summary', {}, 'Agent access & privacy · approval required'),
     el('div', { class: 'agent-disclosure-body' },
       el('p', {}, 'Agents are optional. OmicsANG does not launch a tool or supply context until you choose an agent action and approve its confirmation.'),
-      el('p', {}, 'After approval, the selected CLI runs as your OS account; OmicsANG does not add an OS sandbox. Claude Code and Codex may send the prepared prompt and repository content they read to their providers. OmicsANG does not send shell input to an agent provider; commands or shell startup configuration may use the network.'),
-      el('p', {}, 'Agent CLIs receive a provider-specific environment allowlist rather than unrelated server tokens, SSH-agent sockets, or generic cloud credentials. Environment filtering does not limit what the OS account can read from disk.'),
+      el('p', {}, 'After approval, OmicsANG contains the selected CLI to the repository it was launched against; your home directory and other pipelines are not visible to it. Containment does not limit the network: Claude Code and Codex may send the prepared prompt and repository content they read to their providers. OmicsANG does not send shell input to an agent provider; commands or shell startup configuration may use the network.'),
+      el('p', {}, 'Agent CLIs receive a provider-specific environment allowlist rather than unrelated server tokens, SSH-agent sockets, or generic cloud credentials. Neither containment nor environment filtering limits what an agent may disclose from the repository it can read.'),
       context ? el('p', { class: 'muted' }, context) : null));
 }
 

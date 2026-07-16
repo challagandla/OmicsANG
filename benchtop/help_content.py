@@ -505,7 +505,7 @@ TAB_OPERATIONAL_CONTEXT = {
             "The reviewed prompt plus repository context the approved tool reads.",
         ),
         "writes": (
-            "After confirmation, an approved agent CLI runs as your OS account and may modify accessible files or run commands.",
+            "After confirmation, an approved agent CLI is contained to the selected repository and may modify or run commands there.",
         ),
         "network": (
             "External providers may receive prompt and repository context only after explicit acknowledgement.",
@@ -514,7 +514,7 @@ TAB_OPERATIONAL_CONTEXT = {
             "Agent terminal output is not a durable OmicsANG audit log; provider retention is governed outside OmicsANG.",
         ),
         "cautions": (
-            "OmicsANG does not add an OS sandbox; a Git worktree is change separation, not a security boundary.",
+            "The OS sandbox restricts what an agent can read from disk; it does not restrict what the CLI sends to its provider.",
             "Exclude secrets, private human data, credentials, and unrelated repositories from prompts and scope.",
         ),
         "prerequisites": (
@@ -654,7 +654,7 @@ TAB_OPERATIONAL_CONTEXT = {
             "The reviewed task, selected pipeline metadata, and optional worktree context.",
         ),
         "writes": (
-            "Approved agents may create worktrees and, because they run as your OS account, modify any files that account can access.",
+            "Approved agents may create worktrees and modify files within each target repository they are contained to.",
         ),
         "network": (
             "External-agent providers may receive the reviewed prompt and repository content their approved CLIs read after acknowledgement.",
@@ -663,7 +663,7 @@ TAB_OPERATIONAL_CONTEXT = {
             "Fleet task and target session metadata persist locally; repository edits persist on disk.",
         ),
         "cautions": (
-            "Worktrees separate Git changes but do not restrict agent OS permissions.",
+            "Each agent is contained to its own target repository, but disclosure to providers is not restricted.",
             "Impact and disclosure multiply across targets; inspect every repository result independently.",
         ),
         "prerequisites": (

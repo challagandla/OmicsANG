@@ -6942,8 +6942,9 @@ async def debug_run(body: DebugRequest):
         "tool": body.tool,
         "provider_warning": (
             "This prompt and any repository/log content the agent reads may be "
-            "transmitted under the provider's configuration and terms. The agent "
-            "runs as your OS account; OmicsANG does not add an OS sandbox to the CLI."
+            "transmitted under the provider's configuration and terms. OmicsANG "
+            "contains the CLI to this repository and its own provider "
+            "configuration, but does not restrict what it sends."
         ),
         "pipeline": pipeline_name,
         "repository": str(p.path.resolve()),

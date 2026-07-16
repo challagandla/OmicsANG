@@ -8,6 +8,7 @@ include SECURITY.md
 include environment.yml
 include bootstrap.sh
 include docs/BEGINNER_TUTORIAL.md
+include docs/agent-sandbox.md
 recursive-include docs/assets *.svg
 recursive-include benchtop/web *
 recursive-include omicsang *.py

@@ -143,10 +143,10 @@ class HelpCatalogTest(unittest.TestCase):
                 else (tabs["fleet-task"][field],)
             )
         )
-        self.assertIn("does not add an OS sandbox", agents)
+        self.assertIn("does not restrict what the CLI sends to its provider", agents)
         self.assertIn("not a durable OmicsANG audit log", agents)
-        self.assertIn("OS account", fleet)
-        self.assertIn("not restrict agent OS permissions", fleet)
+        self.assertIn("contained", fleet)
+        self.assertIn("disclosure to providers is not restricted", fleet)
         self.assertNotIn("within the task scope", fleet)
         self.assertNotIn("scoped repository context", fleet)
 
