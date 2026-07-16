@@ -10,7 +10,7 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   exit 1
 fi
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/environment.yml"
 ENV_NAME="omicsang"
 
