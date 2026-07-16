@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """PTY-backed terminal sessions — the single core abstraction of OmicsANG.
 
 Every pipeline run *and* every AI-agent invocation is a `Session`: a real

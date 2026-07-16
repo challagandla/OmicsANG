@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Environment-name compatibility for the OmicsANG rebrand.
 
 The public ``OMICSANG_*`` names are authoritative.  Legacy ``BENCHTOP_*``

@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Command-line launcher for the loopback-only OmicsANG application."""
 
 from __future__ import annotations

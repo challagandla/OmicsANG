@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Benchmark OmicsANG's durable SQLite execution control plane safely.
 
 The benchmark redirects every OmicsANG state path to a temporary directory

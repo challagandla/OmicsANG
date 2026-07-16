@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Run capsules: bounded, durable execution evidence and scientific diffs."""
 
 from __future__ import annotations

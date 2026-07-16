@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 [build-system]
 requires = ["setuptools>=83,<84"]
 build-backend = "setuptools.build_meta"
@@ -10,7 +10,7 @@ dynamic = ["version"]
 description = "All your omics. One workspace."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10,<3.14"
-license = "PolyForm-Noncommercial-1.0.0"
+license = "MIT"
 license-files = [
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
