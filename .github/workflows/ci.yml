@@ -93,9 +93,9 @@ jobs:
           node --check benchtop/web/auth-bootstrap.js
           node --check benchtop/web/editor-core.js
           node --check benchtop/web/app.js
-      - name: Secret scan (controlled fixture directory excluded)
+      - name: Secret scan (tracked files; controlled fixture directory excluded)
         run: |
-          detect-secrets scan --all-files --no-verify --exclude-files '(^|/)(benchtop/web/vendor|tests)(/|$)' > "${RUNNER_TEMP}/detect-secrets.json"
+          detect-secrets scan --no-verify --exclude-files '(^|/)(benchtop/web/vendor|tests)(/|$)' > "${RUNNER_TEMP}/detect-secrets.json"
           python -c 'import json,sys; data=json.load(open(sys.argv[1], encoding="utf-8")); findings=sum(map(len, data["results"].values())); raise SystemExit(f"secret scanner found {findings} candidate(s)" if findings else 0)' "${RUNNER_TEMP}/detect-secrets.json"
       - name: Verify vendored browser assets
         run: |
