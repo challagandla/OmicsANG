@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
@@ -7702,7 +7703,6 @@ async def _recover_durable_state() -> dict:
         store.release_lease("controller:startup-reconcile", INSTANCE_ID, token)
 
 
-@app.on_event("startup")
 async def _startup_reconcile() -> None:
     global STARTUP_RECOVERY
     recovery_complete = False
@@ -7729,7 +7729,6 @@ async def _startup_reconcile() -> None:
     task.add_done_callback(CONTROLLER_TASKS.discard)
 
 
-@app.on_event("shutdown")
 async def _shutdown_record() -> None:
     tasks = list(CONTROLLER_TASKS)
     for task in tasks:
@@ -7762,6 +7761,18 @@ async def _shutdown_record() -> None:
         store.release_lease(_controller_lease_resource(), INSTANCE_ID)
     except Exception:
         pass
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    await _startup_reconcile()
+    try:
+        yield
+    finally:
+        await _shutdown_record()
+
+
+app.router.lifespan_context = _lifespan
 
 
 # ---- public UI metadata --------------------------------------------------
