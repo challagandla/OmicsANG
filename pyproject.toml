@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Anil Kumar Challagandla
 # SPDX-License-Identifier: MIT
 [build-system]
-requires = ["setuptools>=83,<84"]
+requires = ["setuptools>=83,<85"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -56,8 +56,8 @@ dev = [
     "pip-audit>=2.7,<3",
     "pytest>=8.3,<10",
     "ruff>=0.9,<1",
-    "setuptools>=83,<84",
-    "twine>=5.1,<7",
+    "setuptools>=83,<85",
+    "twine>=5.1,<8",
 ]
 
 [project.scripts]
