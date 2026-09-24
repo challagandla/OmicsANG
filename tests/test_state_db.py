@@ -211,7 +211,10 @@ class StateDatabaseTest(unittest.TestCase):
             [entry["id"] for entry in store.history(limit=10)],
             ["newest", "middle", "oldest"],
         )
-        self.assertEqual(store.run_queue_config(1), {"max_cores": 7})
+        self.assertEqual(
+            store.run_queue_config(1),
+            {"max_cores": 7, "max_memory_mb": 0, "max_parallel": 2},
+        )
         self.assertEqual(
             [item["id"] for item in store.run_templates("pipe")], ["new", "old"]
         )

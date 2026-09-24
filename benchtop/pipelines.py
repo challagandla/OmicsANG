@@ -236,7 +236,19 @@ def discover() -> list[Pipeline]:
 def get(name: str) -> Optional[Pipeline]:
     if not _valid_pipeline_id(name) or name in settings.EXCLUDE_DIRS:
         return None
-    return next((pipeline for pipeline in discover() if pipeline.name == name), None)
+    # Resolve just this checkout, preserving discover()'s direct-child fence.
+    # Execution callers deliberately get fresh metadata rather than a UI cache.
+    try:
+        root = settings.ROOT.resolve(strict=True)
+        child = root / name
+        if child.is_symlink() or not child.is_dir():
+            return None
+        resolved = child.resolve(strict=True)
+        if resolved.parent != root:
+            return None
+        return _discover_one(resolved)
+    except (OSError, RuntimeError):
+        return None
 
 
 # --- conda env resolution + command construction --------------------------
@@ -353,6 +365,7 @@ def build_snakemake_argv(
     configfile: str = "",
     profile: str = "",
     cores: int = 8,
+    memory_mb: int = 0,
     dryrun: bool = True,
     use_conda: bool = True,
     extra: str = "",
@@ -374,9 +387,37 @@ def build_snakemake_argv(
         snake += ["--configfile", configfile]
     if profile:
         snake += ["--profile", f"profiles/{profile}"]
-    if extra:
-        snake += shlex.split(extra)
+    extra_tokens = shlex.split(extra or "")
+    if memory_mb:
+        # Merge custom resources into a single option; repeated argparse
+        # --resources options can otherwise discard an earlier resource set.
+        custom_resources = []
+        remaining = []
+        index = 0
+        while index < len(extra_tokens):
+            token = extra_tokens[index]
+            index += 1
+            if token == "--resources":
+                while (
+                    index < len(extra_tokens)
+                    and "=" in extra_tokens[index]
+                    and not extra_tokens[index].startswith("-")
+                ):
+                    custom_resources.append(extra_tokens[index])
+                    index += 1
+            elif token.startswith("--resources="):
+                custom_resources.append(token.split("=", 1)[1])
+            else:
+                remaining.append(token)
+        if any(value.split("=", 1)[0] == "mem_mb" for value in custom_resources):
+            raise ValueError("set mem_mb through the Memory control, not Extra args")
+        snake += remaining + ["--resources", f"mem_mb={memory_mb}", *custom_resources]
+    else:
+        snake += extra_tokens
     if target:
+        if memory_mb:
+            # --resources consumes multiple values; delimit positional targets.
+            snake += ["--"]
         snake += [target]
 
     # wrap in conda/mamba run so snakemake resolves inside the chosen env

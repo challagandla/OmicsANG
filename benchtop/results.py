@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,20 @@ MAX_DIRECTORY_CHILDREN = 1_000
 MAX_GALLERY_DIRS_PER_SOURCE = 2_000
 MAX_GALLERY_ENTRIES_PER_SOURCE = 50_000
 MAX_GALLERY_SECONDS = 2.0
+INVENTORY_TTL = 15.0
+INVENTORY_LIMIT = 4_000
+_INVENTORIES: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
+_INVENTORY_LOCK = threading.Lock()
+_SCAN_LOCKS = [threading.Lock() for _ in range(32)]
+_INVENTORY_GENERATION = 0
+
+
+def invalidate_inventory() -> None:
+    """Invalidate display inventories, including scans currently in flight."""
+    global _INVENTORY_GENERATION
+    with _INVENTORY_LOCK:
+        _INVENTORIES.clear()
+        _INVENTORY_GENERATION += 1
 
 
 class ResultPathError(ValueError):
@@ -226,6 +241,7 @@ def attachments(pipeline: Pipeline) -> list[dict[str, Any]]:
 def attach(pipeline: Pipeline, raw_path: str) -> tuple[dict[str, Any], bool]:
     resolved = validate_directory(pipeline, raw_path)
     _, created = store.attach_results_directory(pipeline.path, resolved)
+    invalidate_inventory()
     record = _source_record(
         pipeline,
         resolved,
@@ -253,6 +269,7 @@ def detach(pipeline: Pipeline, raw_path: str) -> tuple[list[dict[str, Any]], boo
         pipeline.path,
         stored_value,
     )
+    invalidate_inventory()
     return attachments(pipeline), removed
 
 
@@ -453,9 +470,13 @@ def search_directories(
     }
 
 
-def _walk_source(root: Path, deadline: float) -> Iterator[Path | None]:
+def _walk_source(
+    root: Path, deadline: float, scan: dict | None = None
+) -> Iterator[Path | None]:
     """Yield one directory entry per step so roots can be scanned round-robin."""
     root = root.resolve()
+    scan = scan if scan is not None else {}
+    scan.setdefault("truncated", False)
     queue = deque([root])
     visited_dirs = 0
     visited_entries = 0
@@ -477,6 +498,7 @@ def _walk_source(root: Path, deadline: float) -> Iterator[Path | None]:
                         visited_entries > MAX_GALLERY_ENTRIES_PER_SOURCE
                         or time.monotonic() >= deadline
                     ):
+                        scan["truncated"] = True
                         return
                     if entry.is_symlink():
                         yield None
@@ -495,11 +517,15 @@ def _walk_source(root: Path, deadline: float) -> Iterator[Path | None]:
                         else:
                             yield None
                     except OSError:
+                        scan["truncated"] = True
                         yield None
                 if not had_entry:
                     yield None
         except OSError:
+            scan["truncated"] = True
             yield None
+    if queue:
+        scan["truncated"] = True
 
 
 def _display_path(source: dict[str, Any], relative: str) -> str:
@@ -520,8 +546,10 @@ def _gather_sources(
     tables: list[dict[str, Any]] = []
     notebooks: list[dict[str, Any]] = []
     deadline = time.monotonic() + MAX_GALLERY_SECONDS
+    scan: dict = {}
     active = deque(
-        (source, _walk_source(Path(source["path"]), deadline)) for source in sources
+        (source, _walk_source(Path(source["path"]), deadline, scan))
+        for source in sources
     )
     count = 0
     seen_files: set[Path] = set()
@@ -583,8 +611,8 @@ def _gather_sources(
         count += 1
     return {
         "reports": reports,
-        "images": images[:200],
-        "tables": tables[:200],
+        "images": images,
+        "tables": tables,
         "notebooks": notebooks,
         "counts": {
             "reports": len(reports),
@@ -595,7 +623,7 @@ def _gather_sources(
         "scan": {
             "limit": max(1, int(limit)),
             "returned": count,
-            "truncated": bool(active),
+            "truncated": bool(active) or scan.get("truncated", False),
         },
     }
 
@@ -609,6 +637,85 @@ def gather(pipeline: Pipeline, limit: int = 400) -> dict[str, Any]:
             "sources": sources,
             "attachments": _attachment_records(pipeline),
         }
+    )
+    return payload
+
+
+def page(
+    pipeline: Pipeline,
+    *,
+    offset: int = 0,
+    page_size: int = 60,
+    kind: str = "all",
+    query: str = "",
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Page a short-lived UI inventory; never cache file access authorization.
+
+    Source configuration and attachment fences are resolved on every request.
+    Nested output changes expire within the TTL, or immediately on Refresh.
+    Execution/provenance callers continue to use uncached discovery.
+    """
+    sources = _result_sources(pipeline, include_attachments=True)
+    attachment_records = _attachment_records(pipeline)
+    signatures = []
+    for source in sources:
+        try:
+            info = Path(source["path"]).stat()
+            signatures.append(
+                (source["path"], info.st_dev, info.st_ino, info.st_mtime_ns)
+            )
+        except OSError:
+            signatures.append((source["path"], None))
+    key = (str(settings.STATE_DIR), str(pipeline.path.resolve()), tuple(signatures))
+    # Coalesce simultaneous scans of the same checkout without serializing all
+    # requests behind one slow filesystem scan. Memory remains bounded.
+    with _SCAN_LOCKS[hash(key) % len(_SCAN_LOCKS)]:
+        with _INVENTORY_LOCK:
+            cached = _INVENTORIES.get(key)
+            generation = _INVENTORY_GENERATION
+        if refresh or cached is None or time.monotonic() - cached[0] >= INVENTORY_TTL:
+            inventory = _gather_sources(pipeline, sources, limit=INVENTORY_LIMIT)
+            inventory["generated"] = time.time()
+            with _INVENTORY_LOCK:
+                if generation == _INVENTORY_GENERATION:
+                    _INVENTORIES[key] = (time.monotonic(), inventory)
+                    _INVENTORIES.move_to_end(key)
+                    while len(_INVENTORIES) > 32:
+                        _INVENTORIES.popitem(last=False)
+        else:
+            inventory = cached[1]
+    categories = ("reports", "images", "tables", "notebooks")
+    category = "images" if kind == "figures" else kind
+    needle = query.strip().casefold()
+    matching = [
+        (group, item)
+        for group in categories
+        if category in ("all", group)
+        for item in inventory[group]
+        if not needle or needle in f"{item['display_path']} {item['name']}".casefold()
+    ]
+    matching.sort(
+        key=lambda row: (row[0], row[1]["display_path"].casefold(), row[1]["source_id"])
+    )
+    page_size = max(1, min(page_size, 100))
+    offset = max(0, offset)
+    payload = {group: [] for group in categories}
+    for group, item in matching[offset : offset + page_size]:
+        payload[group].append(dict(item))
+    payload.update(
+        counts=dict(inventory["counts"]),
+        scan=dict(inventory["scan"]),
+        generated=inventory["generated"],
+        roots=[source["label"] for source in sources],
+        sources=sources,
+        attachments=attachment_records,
+        pagination={
+            "offset": offset,
+            "page_size": page_size,
+            "total": len(matching),
+            "has_more": offset + page_size < len(matching),
+        },
     )
     return payload
 

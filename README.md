@@ -22,6 +22,7 @@ reviewed dry-run, a real synthetic run, result inspection, and clean shutdown.
 [Synthetic demo](examples/demo-pipeline) ·
 [GitHub repository](https://github.com/challagandla/OmicsANG) ·
 [Security](SECURITY.md) ·
+[Interface performance](docs/performance.md) ·
 [License](LICENSE)
 
 OmicsANG is open-source software under the [MIT License](LICENSE), free to use,
@@ -108,10 +109,10 @@ integration.
 ## Recommended installation with pip and venv
 
 Download and extract an OmicsANG release source archive, then enter its top-level
-directory. For the `0.2.1` source archive, the complete installation is:
+directory. For the `0.2.2` source archive, the complete installation is:
 
 ```bash
-cd omicsang-0.2.1
+cd omicsang-0.2.2
 python3 -m venv "$HOME/.venvs/omicsang"
 . "$HOME/.venvs/omicsang/bin/activate"
 python -m pip install --upgrade pip
@@ -121,11 +122,11 @@ omicsang --version
 
 The installed CLI and web assets no longer depend on that source directory.
 Keep the virtual environment activated when using the commands in the tutorial.
-If you downloaded the `0.2.1` wheel into the current directory, it can be
+If you downloaded the `0.2.2` wheel into the current directory, it can be
 installed in the same environment instead:
 
 ```bash
-python -m pip install ./omicsang-0.2.1-py3-none-any.whl
+python -m pip install ./omicsang-0.2.2-py3-none-any.whl
 ```
 
 Use a fresh virtual environment for the rename. Do not install OmicsANG into an

@@ -4,6 +4,16 @@
 'use strict';
 
 const EditorCore = window.OmicsEditorCore;
+const displayCache = window.OmicsPerformance.createDisplayCache();
+let displayRevision = 0;
+function invalidateDisplayData() {
+  displayCache.clear();
+  displayRevision += 1;
+  state.pipelineHealth = {};
+}
+function displayRead(url, force = false) {
+  return displayCache.read(url, () => api.get(url), force);
+}
 
 let csrfToken = '';
 
@@ -49,12 +59,14 @@ const api = {
   response(url, options = {}) { return apiFetch(url, options); },
   async get(url) { return jsonResponse(await apiFetch(url)); },
   async post(url, body, options = {}) {
-    return jsonResponse(await apiFetch(url, {
+    const result = await jsonResponse(await apiFetch(url, {
       ...options,
       method: 'POST',
       headers: { ...(options.headers || {}), 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {}),
     }));
+    invalidateDisplayData();
+    return result;
   },
   async text(url) {
     const response = await apiFetch(url);
@@ -901,7 +913,9 @@ async function boot() {
     if (recent && !recent.contains(e.target)) recent.open = false;
   });
   await bootstrapAuthentication();
-  state.meta = await api.get('/api/meta');
+  [state.meta, state.pipelines] = await Promise.all([
+    api.get('/api/meta?summary=true'), api.get('/api/pipelines'),
+  ]);
   state.runQueue = state.meta.run_queue || null;
   $('#root-label').textContent = state.meta.root;
   renderToolBadges();
@@ -924,11 +938,10 @@ async function boot() {
     state.pipelineQuery = '';
     renderSidebar();
   };
-  state.pipelines = await api.get('/api/pipelines');
   renderSidebar();
   if (state.pipelines.length) selectPipeline(state.pipelines[0].name);
   pollSessions();
-  setInterval(pollSessions, 2500);
+  document.addEventListener('visibilitychange', () => sessionPoller.visibilityChanged());
 }
 
 function renderToolBadges() {
@@ -965,12 +978,25 @@ function renderSidebar() {
 }
 
 async function selectPipeline(name) {
+  const token = ++state.navigation.restoreToken;
+  state.navigation.restoring = false;
   state.selected = name;
   state.view = 'pipeline';
+  state.detail = null;
   renderSidebar();
-  state.detail = await api.get(`/api/pipelines/${encodeURIComponent(name)}`);
-  if (!['overview','browse','study','run','dag','results','capsules','config','sra_geo','code','resources','github','agents','terminal'].includes(state.tab)) state.tab = 'overview';
   render();
+  try {
+    const url = `/api/pipelines/${encodeURIComponent(name)}`;
+    const detail = await displayRead(`${url}?summary=true`);
+    if (token !== state.navigation.restoreToken || state.selected !== name) return;
+    state.detail = detail;
+    if (!['overview','browse','study','run','dag','results','capsules','config','sra_geo','code','resources','github','agents','terminal'].includes(state.tab)) state.tab = 'overview';
+    render();
+  } catch (e) {
+    if (token === state.navigation.restoreToken) {
+      $('#view').replaceChildren(el('div', { class: 'empty', role: 'alert' }, e.message));
+    }
+  }
 }
 
 /* ---------------- tabs + view ---------------- */
@@ -1075,7 +1101,7 @@ async function applyNavigationSnapshot(snapshot, restoring = false) {
   try {
     const detail = state.selected === pipeline.name && state.detail
       ? state.detail
-      : await api.get(`/api/pipelines/${encodeURIComponent(pipeline.name)}`);
+      : await displayRead(`/api/pipelines/${encodeURIComponent(pipeline.name)}?summary=true`);
     if (token !== state.navigation.restoreToken) return;
     state.selected = pipeline.name;
     state.detail = detail;
@@ -1201,8 +1227,24 @@ function render() {
   setViewSemantics(view, primaryActive ? navDomId(active[0]) : moreNavDomId(active[0]));
   document.title = `${active[1]} · ${scope} · OmicsANG`;
   if (!state.detail) {
-    view.append(el('div', { class: 'empty' }, 'No pipeline selected'));
+    view.append(el('div', { class: 'empty', role: 'status' }, state.selected ? 'Loading pipeline…' : 'No pipeline selected'));
     renderHelpDrawer();
+    return;
+  }
+  // Operational forms need full metadata; browsing and the overview can paint
+  // from the cheap summary while deeper status is fetched independently.
+  if (state.detail.summary_only && ['run', 'dag', 'config', 'sra_geo', 'resources', 'agents'].includes(state.tab)) {
+    const selected = state.detail;
+    const requestedTab = state.tab;
+    view.append(el('div', { class: 'muted', role: 'status' }, 'Loading pipeline tools…'));
+    displayRead(`/api/pipelines/${encodeURIComponent(selected.name)}`).then(detail => {
+      if (state.detail !== selected || state.view !== 'pipeline' || state.tab !== requestedTab) return;
+      state.detail = detail;
+      render();
+    }).catch(error => {
+      if (state.detail === selected && state.view === 'pipeline' && state.tab === requestedTab)
+        view.replaceChildren(el('div', { class: 'empty', role: 'alert' }, error.message));
+    });
     return;
   }
   ({ overview: viewOverview, browse: viewBrowse, study: viewStudy, run: viewRun, dag: viewDag, results: viewResults, capsules: viewCapsules,
@@ -1513,6 +1555,7 @@ function renderMonitor() {
         },
       }, '×')),
     monitorMeter(q),
+    systemResourceMonitor(q),
     monitorSection('Active queue', rows, s => queueMonitorRow(s)),
     monitorSection('Live terminals', liveSessions, s => sessionMonitorRow(s)),
     monitorSection('Failed runs', failedRuns, s => sessionMonitorRow(s, true)),
@@ -1532,15 +1575,44 @@ function monitorMeter(q) {
 function monitorSection(title, rows, renderRow) {
   const wrap = el('section', { class: 'monitor-section' }, el('h3', {}, title));
   if (!rows.length) wrap.append(el('div', { class: 'empty slim' }, 'None'));
-  else rows.slice(0, 8).forEach(r => wrap.append(renderRow(r)));
+  else rows.slice(0, title === 'Active queue' ? 32 : 8).forEach(r => wrap.append(renderRow(r)));
   return wrap;
 }
 
 function queueMonitorRow(s) {
+  const id = (s.meta && s.meta.durable_job_id) || s.id;
+  const usage = (((state.runQueue || {}).monitor || {}).jobs || {})[id];
+  const meta = s.meta || {};
+  const actual = usage && usage.available
+    ? `${usage.cpu_cores == null ? 'Sampling CPU…' : `${usage.cpu_cores.toFixed(2)} CPU cores`} · ${(usage.memory_mb / 1000).toFixed(2)} GB RSS`
+    : meta.queue_reason || 'Usage not available yet';
   return el('button', { class: 'monitor-row', onclick: () => focusOrOpen(s) },
     el('span', { class: `dot ${s.status}` }),
-    el('span', { class: 'monitor-title' }, s.title || s.command || s.id),
+    el('span', { class: 'monitor-title' },
+      el('span', {}, s.title || s.command || s.id),
+      el('small', { class: 'resource-usage' }, actual),
+      el('small', { class: 'resource-usage' }, `Reserved: ${meta.cores || 1} cores · ${meta.memory_mb ? (meta.memory_mb / 1000).toFixed(1) + ' GB' : 'legacy/unset memory'}`)),
     el('span', { class: 'tag' }, s.status));
+}
+
+function systemResourceMonitor(q) {
+  const detected = q.detected || {};
+  const usage = q.monitor || {};
+  const gb = value => value == null ? '—' : `${(value / 1000).toFixed(1)} GB`;
+  const usedMemory = detected.total_memory_mb == null ? null : detected.total_memory_mb - detected.available_memory_mb;
+  const meter = (label, percent) => el('div', { class: 'meter-track', role: 'meter', 'aria-label': label,
+    'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': percent == null ? null : Math.round(percent) },
+    el('div', { class: 'meter-fill', style: `width:${Math.max(0, Math.min(100, percent || 0))}%` }));
+  return el('section', { class: 'monitor-section' },
+    el('h3', {}, 'System usage'),
+    el('div', { class: 'resource-usage' }, `CPU: ${usage.system_cpu_percent == null ? 'sampling…' : usage.system_cpu_percent + '%'} · ${detected.effective_cpus || '—'} available logical CPUs`),
+    meter('System CPU usage', usage.system_cpu_percent),
+    el('div', { class: 'resource-usage' }, `RAM in use: ${gb(usedMemory)} / ${gb(detected.total_memory_mb)} · ${gb(detected.available_memory_mb)} available`),
+    meter('System memory usage', detected.total_memory_mb ? usedMemory / detected.total_memory_mb * 100 : null),
+    el('div', { class: 'resource-usage' }, `Pipeline budget: ${q.max_cores || '—'} cores · ${gb(q.max_memory_mb)}`),
+    el('div', { class: 'resource-usage' }, `Reserved: ${q.active_cores || 0} cores · ${gb(q.active_memory_mb)}`),
+    el('div', { class: 'resource-usage' }, `Up to ${q.max_parallel || 1} simultaneous pipelines · automatic queue`),
+    el('div', { class: 'muted' }, 'CPU is measured across the host. Per-pipeline RSS sums its processes and may include shared pages.'));
 }
 
 function sessionMonitorRow(s, failed = false) {
@@ -1621,6 +1693,8 @@ function viewOverview(view) {
   const healthHost = el('div', { class: 'dashboard-grid' });
   const runRows = el('div', { class: 'timeline-list' });
   const queue = pipelineQueueRows(d.name);
+  const gitFact = el('div', {}, g.is_repo ? `${g.branch || 'repo'} · ${g.dirty ? `${g.dirty} changed` : 'clean'}` : d.summary_only ? 'Checking…' : '—');
+  const envFact = el('div', {}, d.conda_env || d.env_resolved || '—');
 
   const go = (tab) => { state.tab = tab; render(); };
   const runAction = () => {
@@ -1638,6 +1712,7 @@ function viewOverview(view) {
         el('span', { class: `health-pill ${status.level === 'error' ? 'error' : status.level === 'warn' ? 'warn' : 'ok'}` }, status.label),
         el('span', { class: 'muted' }, status.note))),
     el('div', { class: 'action-strip' },
+      el('button', { class: 'ghost', onclick: () => { invalidateDisplayData(); selectPipeline(d.name); } }, 'Refresh status'),
       el('button', { class: action.tone === 'danger' ? 'danger' : '', onclick: runAction }, action.label),
       el('button', { class: 'ghost', onclick: () => go('run') }, 'Dry-run'),
       el('button', { class: 'ghost', onclick: () => go('results') }, 'Results'),
@@ -1653,15 +1728,18 @@ function viewOverview(view) {
         el('h3', {}, 'Pipeline facts'),
         el('div', { class: 'kv compact' },
           el('div', { class: 'k' }, 'Snakefile'), el('div', {}, shortPath(d.snakefile)),
-          el('div', { class: 'k' }, 'Conda env'), el('div', {}, d.conda_env || d.env_resolved || '—'),
+          el('div', { class: 'k' }, 'Conda env'), envFact,
           el('div', { class: 'k' }, 'Configs'), el('div', {}, (d.configs || []).map(x => shortPath(x, 2)).join(', ') || '—'),
           el('div', { class: 'k' }, 'Profiles'), el('div', {}, (d.profiles || []).map(x => shortPath(x, 2)).join(', ') || '—'),
-          el('div', { class: 'k' }, 'Git'), el('div', {},
-            g.is_repo ? `${g.branch || 'repo'} · ${g.dirty ? `${g.dirty} changed` : 'clean'}` : '—'),
+          el('div', { class: 'k' }, 'Git'), gitFact,
           el('div', { class: 'k' }, 'Queue'), el('div', {}, queue.length ? `${queue.length} active or queued` : 'idle')))));
 
   renderRunTimeline(runRows, d);
-  loadPipelineDashboard(d.name, healthHost);
+  loadPipelineDashboard(d.name, healthHost, h => {
+    const git = h.git || {};
+    gitFact.textContent = git.is_repo ? `${git.branch || 'repo'} · ${git.dirty ? `${git.dirty} changed` : 'clean'}` : '—';
+    envFact.textContent = h.env_resolved || d.conda_env || '—';
+  });
 }
 
 function renderRunTimeline(host, d) {
@@ -1679,16 +1757,18 @@ function renderRunTimeline(host, d) {
   });
 }
 
-async function loadPipelineDashboard(name, host) {
+async function loadPipelineDashboard(name, host, onHealth = () => {}) {
   const d = state.detail;
+  const revision = displayRevision;
   const cached = pipelineHealthSnapshot(name);
   const draw = (h) => {
+    onHealth(h);
     const diag = h && h.diagnostics || {};
     const run = h && h.run_state || {};
     const fresh = h && h.result_freshness || {};
     host.innerHTML = '';
     host.append(
-      dashboardTile('Diagnostics', diag.error == null ? '—' : `${diag.error || 0} err · ${diag.warning || 0} warn`, diag.error ? 'error' : diag.warning ? 'warn' : 'ok'),
+      dashboardTile('Diagnostics', diag.error == null ? 'Not checked' : `${diag.error || 0} err · ${diag.warning || 0} warn${h.diagnostics_scan && h.diagnostics_scan.truncated ? ' · partial scan' : ''}`, diag.error ? 'error' : diag.error == null || diag.warning || (h.diagnostics_scan && h.diagnostics_scan.truncated) ? 'warn' : 'ok'),
       dashboardTile('Runs', `${(run.running || []).length} running · ${(run.queued || []).length} queued`, (run.running || []).length ? 'running' : 'ok'),
       dashboardTile('Results', fresh.latest ? fmtTime(fresh.latest) : 'No outputs', fresh.latest ? 'ok' : 'warn'),
       dashboardTile('Environment', h && h.env_resolved ? shortPath(h.env_resolved, 2) : (d.env_resolved || d.conda_env || '—'), h && h.env_resolved ? 'ok' : 'warn'),
@@ -1697,9 +1777,13 @@ async function loadPipelineDashboard(name, host) {
   if (cached) draw(cached);
   else host.append(dashboardTile('Health', 'loading...', 'running'));
   try {
-    const h = await api.get(`/api/pipelines/${name}/health`);
+    const h = await displayRead(`/api/pipelines/${encodeURIComponent(name)}/health`);
+    if (revision !== displayRevision) {
+      if (host.isConnected && state.selected === name) loadPipelineDashboard(name, host, onHealth);
+      return;
+    }
     state.pipelineHealth[name] = h;
-    if (state.detail && state.detail.name === name) draw(h);
+    if (host.isConnected && state.detail && state.detail.name === name) draw(h);
   } catch (e) {
     host.innerHTML = '';
     host.append(dashboardTile('Health', e.message, 'error'));
@@ -1720,8 +1804,10 @@ function dashboardTile(label, value, level = 'ok') {
 
 /* ---------------- run ---------------- */
 function defaultRunForm(d) {
+  const allocation = (state.runQueue && state.runQueue.recommended) || { cores: 1, memory_mb: 0 };
   return {
-    target: '', configfile: '', profile: '', cores: 8, dryrun: true, use_conda: true,
+    target: '', configfile: '', profile: '', cores: allocation.cores, memory_mb: allocation.memory_mb,
+    auto_resources: true, allow_parallel: true, dryrun: true, use_conda: true,
     extra: '', env: d.env_resolved || d.conda_env || '', study_sheet: '', study_roles: {}, study_override: false,
     plan_digest: '',
   };
@@ -2120,12 +2206,13 @@ async function refreshRunQueue(shouldRender = false) {
 function runQueuePanel() {
   const q = state.runQueue || { max_cores: 1, active_cores: 0, running: [], queued: [], lost: [] };
   const maxIn = el('input', { type: 'number', min: 1, max: 1024, value: q.max_cores || 1, style: 'max-width:90px' });
+  const parallelIn = el('input', { type: 'number', min: 1, max: 16, value: q.max_parallel || 2, style: 'max-width:70px' });
   const status = el('span', { class: 'muted' },
-    `${q.active_cores || 0}/${q.max_cores || 1} local cores active · ${(q.queued || []).length} queued · ${(q.lost || []).length} orphaned`);
+    `${q.active_cores || 0}/${q.max_cores || 1} cores reserved · ${((q.active_memory_mb || 0) / 1000).toFixed(1)}/${((q.max_memory_mb || 0) / 1000).toFixed(1)} GB reserved · ${(q.queued || []).length} queued`);
   const save = async () => {
     status.textContent = 'saving budget...';
     try {
-      state.runQueue = await api.post('/api/run_queue', { max_cores: +maxIn.value || 1 });
+      state.runQueue = await api.post('/api/run_queue', { max_cores: +maxIn.value || 1, max_parallel: +parallelIn.value || 1 });
       render();
     } catch (e) {
       status.textContent = 'error: ' + e.message;
@@ -2146,7 +2233,7 @@ function runQueuePanel() {
       el('span', { class: `dot ${s.status}` }),
       el('span', { class: 'queue-title' }, s.title || s.command),
       el('span', { class: 'tag' }, durableState),
-      el('span', { class: 'muted' }, `${cores} cores${reserved ? ' reserved' : ''} · ${identity || String(durableId).slice(0, 12)}`),
+      el('span', { class: 'muted' }, `${cores} cores · ${(((s.meta || {}).memory_mb || 0) / 1000).toFixed(1)} GB${reserved ? ' reserved' : ''} · ${(s.meta || {}).queue_reason || identity || String(durableId).slice(0, 12)}`),
       cancellable ? el('button', { class: 'ghost sm danger-outline', onclick: async (e) => {
         e.stopPropagation();
         if (!window.confirm(`Cancel ${s.title || durableId}?`)) return;
@@ -2174,8 +2261,10 @@ function runQueuePanel() {
     el('div', { class: 'toolbar' },
       el('strong', {}, 'Run queue'),
       el('label', { class: 'inline' }, 'Max local cores ', maxIn),
+      el('label', { class: 'inline' }, 'Parallel pipelines ', parallelIn),
       el('button', { class: 'ghost sm', onclick: save }, 'Save budget'),
       status),
+    el('div', { class: 'muted' }, 'Queued pipelines start automatically within CPU and memory limits. Repeated runs of the same pipeline wait for its current run to finish.'),
     list);
 }
 
@@ -2400,7 +2489,9 @@ function viewRun(view) {
   const cfgSel = el('select', {}, ...cfgOpts.map(c => el('option', { value: c, selected: c === f.configfile ? '' : null }, c || '(default config)')));
   const profSel = el('select', {}, ...profOpts.map(c => el('option', { value: c, selected: c === f.profile ? '' : null }, c || '(no profile)')));
   const envSel = el('select', {}, ...envOpts.map(c => el('option', { value: c, selected: c === f.env ? '' : null }, c)));
-  const coresIn = el('input', { type: 'number', value: f.cores, min: 1, max: 128 });
+  const coresIn = el('input', { type: 'number', value: f.cores, min: 1, max: (state.runQueue || {}).max_cores || 1024 });
+  const memoryIn = el('input', { type: 'number', value: f.memory_mb || 0, min: 1, step: 1 });
+  const autoIn = el('input', { type: 'checkbox' }); autoIn.checked = f.auto_resources !== false;
   const dryIn = el('input', { type: 'checkbox' }); dryIn.checked = f.dryrun;
   const condaIn = el('input', { type: 'checkbox' }); condaIn.checked = f.use_conda;
   const extraIn = el('input', { type: 'text', value: f.extra, placeholder: 'e.g. --until align --rerun-incomplete' });
@@ -2410,9 +2501,16 @@ function viewRun(view) {
   let studyConfig = f.configfile;
 
   const sync = () => {
+    if (autoIn.checked && state.runQueue && state.runQueue.recommended) {
+      coresIn.value = state.runQueue.recommended.cores;
+      memoryIn.value = state.runQueue.recommended.memory_mb;
+    }
+    coresIn.disabled = autoIn.checked;
+    memoryIn.disabled = autoIn.checked;
     const configChanged = studyConfig !== cfgSel.value;
     Object.assign(f, { target: targetIn.value, configfile: cfgSel.value, profile: profSel.value,
-      cores: +coresIn.value, dryrun: dryIn.checked, use_conda: condaIn.checked,
+      cores: +coresIn.value, memory_mb: +memoryIn.value, auto_resources: autoIn.checked,
+      allow_parallel: true, dryrun: dryIn.checked, use_conda: condaIn.checked,
       extra: extraIn.value, env: envSel.value });
     f.plan_digest = '';
     if (configChanged) {
@@ -2434,7 +2532,7 @@ function viewRun(view) {
       refreshRunStudyGate(d, f, studyHost, () => updatePreview(d.name, f, preview));
     }
   };
-  [targetIn, cfgSel, profSel, envSel, coresIn, dryIn, condaIn, extraIn].forEach(e => e.addEventListener('input', sync));
+  [targetIn, cfgSel, profSel, envSel, coresIn, memoryIn, autoIn, dryIn, condaIn, extraIn].forEach(e => e.addEventListener('input', sync));
 
   view.append(
     el('div', { class: 'view-head' },
@@ -2452,6 +2550,10 @@ function viewRun(view) {
           el('div', {}, el('label', {}, 'Profile'), profSel),
           el('div', {}, el('label', {}, 'Cores'), coresIn)),
         el('div', {}, el('label', {}, 'Extra args'), extraIn),
+        el('div', { class: 'grid2' },
+          el('label', { class: 'inline switch' }, autoIn, ' Automatically allocate CPU and memory'),
+          el('div', {}, el('label', {}, 'Memory reservation (MB)'), memoryIn)),
+        el('div', { class: 'muted' }, 'Allocations leave system headroom and are fixed in the reviewed command. Memory is a scheduler reservation, not an operating-system limit.'),
         el('div', { class: 'switch-row' },
           el('label', { class: 'inline switch' }, dryIn, ' dry-run (-n)'),
           el('label', { class: 'inline switch' }, condaIn, ' --use-conda'))),
@@ -2475,11 +2577,14 @@ function runImpactPanel(f) {
   const requested = Math.max(1, Number(f.cores || 1));
   const max = Math.max(1, Number(q.max_cores || 1));
   const after = Math.min(100, Math.round((((q.active_cores || 0) + requested) / max) * 100));
-  const queued = requested + (q.active_cores || 0) > max;
+  const queued = requested + (q.active_cores || 0) > max ||
+    (q.running || []).length >= (q.max_parallel || 1) ||
+    (Number(f.memory_mb) || 0) + (q.active_memory_mb || 0) > (q.max_memory_mb || 0) ||
+    (Number(f.memory_mb) || 0) > ((q.detected || {}).available_for_launch_mb || 0);
   return el('section', { class: `panel run-impact ${queued ? 'warn' : 'ok'}` },
     el('h3', {}, 'Launch impact'),
     el('div', { class: 'impact-grid' },
-      el('div', {}, el('span', { class: 'metric-label' }, 'Requested'), el('strong', {}, `${requested} cores`)),
+      el('div', {}, el('span', { class: 'metric-label' }, 'Requested'), el('strong', {}, `${requested} cores · ${((f.memory_mb || 0) / 1000).toFixed(1)} GB`)),
       el('div', {}, el('span', { class: 'metric-label' }, 'Queue'), el('strong', {}, queued ? 'Will queue' : 'Can start')),
       el('div', {}, el('span', { class: 'metric-label' }, 'After launch'), el('strong', {}, `${after}% budget`))));
 }
@@ -2524,6 +2629,11 @@ async function launchRun(name, f, dryrun) {
   let intent = null;
   try {
     const d = state.detail;
+    if (f.auto_resources !== false) {
+      state.runQueue = await api.get('/api/run_queue');
+      Object.assign(f, state.runQueue.recommended || {});
+    }
+    if (!(Number(f.memory_mb) > 0)) throw new Error('No memory allocation is available. Check system memory or enter a manual reservation.');
     const studyCache = state.study[name];
     const cached = studyCache && studyCache.configfile === f.configfile &&
       studyCache.sheet === (f.study_sheet || '') && studyCache.rolesKey === studyRolesKey(f.study_roles)
@@ -2531,6 +2641,7 @@ async function launchRun(name, f, dryrun) {
     const body = {
       ...f,
       dryrun,
+      allow_parallel: true,
       study_sheet: cached && cached.selected ? cached.selected.path : (f.study_sheet || ''),
       study_roles: cached && cached.roles ? cached.roles : (f.study_roles || {}),
       study_override: false,
@@ -2560,7 +2671,7 @@ async function launchRun(name, f, dryrun) {
     }
     const mode = dryrun ? 'dry-run' : 'REAL RUN';
     const confirmed = window.confirm(
-      `Launch locked ${mode}?\n\n${planned.command}\n\n${shortPlanDigest(body.plan_digest)}`,
+      `Launch locked ${mode}?\n\n${planned.command}\n\n${shortPlanDigest(body.plan_digest)}\n\nAllocation: ${body.cores} cores and ${(body.memory_mb / 1000).toFixed(1)} GB. This run may start alongside other pipelines when capacity is available.`,
     );
     if (!confirmed) return;
     intent = pendingSubmissionIntent(`local:${name}`, body.plan_digest);
@@ -3146,68 +3257,93 @@ async function viewResults(view) {
   const d = state.detail;
   const refresh = el('button', { class: 'ghost sm' }, 'Refresh');
   view.append(el('div', { class: 'view-head' },
-    el('div', {}, el('h2', {}, `Results · ${d.name}`), el('div', { class: 'muted' }, 'Review QC, figures, reports, tables, and result freshness in one place.')),
+    el('div', {}, el('h2', {}, `Results · ${d.name}`), el('div', { class: 'muted' }, 'Review QC, figures, reports, and tables.')),
     refresh));
-  const slot = el('div', {}, el('div', { class: 'muted' }, 'scanning outputs & parsing QC…'));
-  view.append(slot);
-
   const rf = state.resultsFilter[d.name] || (state.resultsFilter[d.name] = { q: '', type: 'all' });
-  let r = null;
-  let q = null;
+  const sourcesHost = el('div');
+  const summary = el('div', { class: 'results-summary' });
+  const queryIn = el('input', {
+    type: 'text', value: rf.q || '', placeholder: 'Filter result files', 'aria-label': 'Filter result files',
+  });
+  const typeSel = el('select', { 'aria-label': 'Filter result type' },
+    ...[['all', 'All files'], ['figures', 'Figures'], ['reports', 'Reports'], ['tables', 'Tables'], ['notebooks', 'Notebooks']].map(([v, l]) =>
+      el('option', { value: v, selected: rf.type === v ? '' : null }, l)));
+  const status = el('div', { class: 'muted', role: 'status', 'aria-live': 'polite' }, 'Scanning outputs…');
+  const qcStatus = el('div', { class: 'muted', role: 'status' }, 'Loading QC…');
+  const pager = el('div', { class: 'toolbar', 'aria-label': 'Result pages' });
+  const content = el('div');
+  view.append(sourcesHost, summary, el('div', { class: 'result-filterbar' }, queryIn, typeSel), status, qcStatus, pager, content);
+  let r = null, q = { panels: [] }, offset = 0, request = 0, qcRequest = 0, filterTimer = null;
+  const endpoint = `/api/pipelines/${encodeURIComponent(d.name)}`;
+  const drawContent = () => renderResultsContent(content, d, r || {}, q, rf);
 
-  const draw = () => {
-    slot.innerHTML = '';
-    const counts = (r && r.counts) || {};
-    const sources = resultSources(r || {});
-    const availableSources = sources.filter(source => source.available).length;
-    const queryIn = el('input', {
-      type: 'text', value: rf.q || '',
-      placeholder: 'Filter results, samples, reports, or figure names',
-      'aria-label': 'Filter result files',
-    });
-    const typeSel = el('select', { 'aria-label': 'Filter result type' },
-      ...[['all', 'All files'], ['figures', 'Figures'], ['reports', 'Reports'], ['tables', 'Tables'], ['notebooks', 'Notebooks']].map(([v, l]) =>
-        el('option', { value: v, selected: rf.type === v ? '' : null }, l)));
-    const content = el('div', {});
-    const redraw = () => {
-      rf.q = queryIn.value;
-      rf.type = typeSel.value;
-      renderResultsContent(content, d, r || {}, q || { panels: [] }, rf);
-    };
-    queryIn.oninput = redraw;
-    typeSel.oninput = redraw;
-    slot.append(
-      resultDirectoryManager(d, r || {}, rf, load),
-      el('div', { class: 'results-summary' },
-        resultStat('Reports', String(counts.reports || 0), counts.reports ? 'ok' : 'warn'),
-        resultStat('Figures', String(counts.images || 0), counts.images ? 'ok' : 'warn'),
-        resultStat('Tables', String(counts.tables || 0), counts.tables ? 'ok' : 'warn'),
-        resultStat(
-          'Sources',
-          availableSources === sources.length ? String(sources.length) : `${availableSources} / ${sources.length} available`,
-          availableSources ? 'ok' : 'warn')),
-      el('div', { class: 'result-filterbar' }, queryIn, typeSel),
-      content);
-    redraw();
-  };
+  function draw() {
+    sourcesHost.replaceChildren(resultDirectoryManager(d, r, rf, () => { offset = 0; return load(true); }));
+    const counts = r.counts || {};
+    summary.replaceChildren(
+      resultStat('Reports', String(counts.reports || 0), counts.reports ? 'ok' : 'warn'),
+      resultStat('Figures', String(counts.images || 0), counts.images ? 'ok' : 'warn'),
+      resultStat('Tables', String(counts.tables || 0), counts.tables ? 'ok' : 'warn'));
+    const page = r.pagination;
+    const first = page.total ? page.offset + 1 : 0;
+    const last = Math.min(page.offset + page.page_size, page.total);
+    status.textContent = `${first}–${last} of ${page.total} matching files · scanned ${fmtTime(r.generated)}` +
+      (r.scan && r.scan.truncated ? ' · Partial inventory: scan limit reached; attach a narrower result directory to see more.' : '');
+    pager.replaceChildren(
+      el('button', { class: 'ghost sm', disabled: page.offset <= 0 ? '' : null,
+        onclick: () => { offset = Math.max(0, page.offset - page.page_size); load(); } }, 'Previous'),
+      el('button', { class: 'ghost sm', disabled: !page.has_more ? '' : null,
+        onclick: () => { offset = page.offset + page.page_size; load(); } }, 'Next'));
+    drawContent();
+  }
 
-  async function load() {
-    refresh.disabled = true;
+  async function loadQc(force = false) {
+    const current = ++qcRequest;
+    qcStatus.textContent = 'Loading QC…';
     try {
-      [r, q] = await Promise.all([
-        api.get(`/api/pipelines/${encodeURIComponent(d.name)}/results`),
-        api.get(`/api/pipelines/${encodeURIComponent(d.name)}/qc`).catch(() => ({ panels: [] })),
-      ]);
-      draw();
-    } catch (e) {
-      slot.innerHTML = '';
-      slot.append(el('div', { class: 'empty' }, e.message));
-    } finally {
-      refresh.disabled = false;
+      const value = await displayRead(`${endpoint}/qc`, force);
+      if (current !== qcRequest || !content.isConnected) return;
+      q = value;
+      qcStatus.textContent = '';
+      if (r) drawContent();
+    } catch (error) {
+      if (current === qcRequest && content.isConnected) qcStatus.textContent = `QC unavailable: ${error.message}`;
     }
   }
 
-  refresh.onclick = load;
+  async function load(force = false) {
+    const current = ++request;
+    refresh.disabled = true;
+    for (const button of pager.querySelectorAll('button')) button.disabled = true;
+    const params = new URLSearchParams({ offset: String(offset), page_size: '60', kind: rf.type, q: rf.q || '', refresh: String(force) });
+    if (force) { q = { panels: [] }; loadQc(true); }
+    try {
+      const value = await api.get(`${endpoint}/results?${params}`);
+      if (current !== request || !content.isConnected) return;
+      // An expiring inventory may shrink between pages.
+      if (offset && value.pagination.total <= offset) { offset = 0; return load(); }
+      r = value;
+      draw();
+    } catch (error) {
+      if (current === request && content.isConnected) status.textContent = `Results unavailable: ${error.message}`;
+    } finally {
+      if (current === request) refresh.disabled = false;
+    }
+  }
+
+  const filter = () => {
+    rf.q = queryIn.value;
+    rf.type = typeSel.value;
+    offset = 0;
+    request += 1; // Invalidate the old page before the debounce expires.
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(() => { if (content.isConnected) load(); }, 200);
+  };
+  queryIn.oninput = filter;
+  typeSel.onchange = filter;
+  refresh.onclick = () => { offset = 0; load(true); };
+  state.resultsRefresh = { name: d.name, refresh: () => { if (content.isConnected) { offset = 0; load(true); } } };
+  loadQc();
   await load();
 }
 
@@ -5559,7 +5695,7 @@ function viewCode(view) {
     const focusedNode = c.visibleTree.find(node => node.path === c.focusPath);
     if (focusedNode && focusedNode.domId) fileList.setAttribute('aria-activedescendant', focusedNode.domId);
     const visible = info.query ? `${info.matchingFiles.length}/${c.files.length}` : `${c.files.length}`;
-    setStatus(`${visible} editable files`);
+    setStatus(`${visible} editable files${c.filesScan && c.filesScan.truncated ? ' · partial scan' : ''}`);
   };
 
   const loadFiles = async (force = false) => {
@@ -5573,6 +5709,7 @@ function viewCode(view) {
     try {
       const res = await api.get(`/api/pipelines/${d.name}/files?limit=1200`);
       c.files = res.files || [];
+      c.filesScan = res.scan || null;
       c.loaded = true;
       renderTree();
       if (!c.tabs.length && !c.loadedPath && c.files.length) openFile(c.files[0].path, false);
@@ -5858,10 +5995,10 @@ function viewCode(view) {
     diagnosticsPanel.append(el('div', { class: 'diag-head' },
       el('strong', {}, 'Diagnostics'),
       el('span', { class: 'diag-summary' },
-        `${s.error || 0} errors · ${s.warning || 0} warnings · ${data.scanned || 0} files scanned`),
+        `${s.error || 0} errors · ${s.warning || 0} warnings · ${data.scanned || 0} files scanned${data.scan && data.scan.truncated ? ' · partial scan' : ''}`),
       el('button', { class: 'ghost sm', onclick: () => { c.diagnostics = null; renderDiagnostics(); } }, 'Hide')));
     if (!(data.items || []).length) {
-      diagnosticsPanel.append(el('div', { class: 'diag-empty' }, 'No issues found by the lightweight scanner.'));
+      diagnosticsPanel.append(el('div', { class: 'diag-empty' }, data.scan && data.scan.truncated ? 'No issues found in the scanned subset; the scan was incomplete.' : 'No issues found by the lightweight scanner.'));
       return;
     }
     const list = el('div', { class: 'diag-list' });
@@ -6873,12 +7010,27 @@ async function debugWithClaude(sessionId) {
 }
 
 /* ---------------- sessions bar ---------------- */
-async function pollSessions() {
+const sessionPoller = window.OmicsPerformance.createPoller({
+  task: updateSessions,
+  visible: () => !document.hidden,
+  delay: () => state.sessions.some(s => isLiveStatus(s.status)) ||
+    (state.runQueue && ((state.runQueue.running || []).length || (state.runQueue.queued || []).length)) ? 2500 : 15000,
+});
+function pollSessions() { return sessionPoller.run(); }
+
+async function updateSessions() {
   try {
     const [sessions, queue] = await Promise.all([
       api.get('/api/sessions'),
       api.get('/api/run_queue').catch(() => state.runQueue),
     ]);
+    const previous = new Map(state.sessions.map(s => [s.id, s.status]));
+    const changed = previous.size > 0 && sessions.some(s => previous.get(s.id) !== s.status);
+    if (changed) {
+      invalidateDisplayData();
+      if (state.view === 'pipeline' && state.tab === 'results' && state.resultsRefresh && state.resultsRefresh.name === state.selected)
+        state.resultsRefresh.refresh();
+    }
     state.sessions = sessions;
     state.runQueue = queue || state.runQueue;
   } catch (e) { return; }
@@ -6904,7 +7056,10 @@ async function focusOrOpen(s) {
   const pipeline = s.meta && s.meta.pipeline;
   if (pipeline && state.selected !== pipeline) {
     state.selected = pipeline;
-    state.detail = await api.get(`/api/pipelines/${pipeline}`);
+    const token = ++state.navigation.restoreToken;
+    const detail = await displayRead(`/api/pipelines/${encodeURIComponent(pipeline)}?summary=true`);
+    if (token !== state.navigation.restoreToken || state.selected !== pipeline) return;
+    state.detail = detail;
     renderSidebar();
   }
   state.view = 'pipeline';

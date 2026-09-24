@@ -44,6 +44,7 @@ from . import (
     fs_policy,
     git_ops,
     help_content,
+    local_resources,
     pipelines,
     provenance,
     qc,
@@ -869,26 +870,45 @@ DOWNLOAD_SKIP_PARTS = {
 }
 
 
-def _iter_code_files(root: Path, limit: int = 500):
+def _iter_code_files(root: Path, limit: int = 500, *, scan: dict | None = None):
+    """Prune excluded trees before traversal; expose bounded-scan status."""
+    scan = scan if scan is not None else {}
+    scan.update(truncated=False, visited=0)
+    deadline = time.monotonic() + 2.0
     seen = 0
-    for path in root.rglob("*"):
-        if seen >= limit:
-            break
+    queue = deque([root])
+    while queue:
+        directory = queue.popleft()
         try:
-            rel_parts = path.relative_to(root).parts
-        except ValueError:
-            continue
-        if any(part in CODE_SKIP_DIRS for part in rel_parts[:-1]):
-            continue
-        try:
-            if not path.is_file() or not _is_code_candidate(path):
-                continue
-            if path.stat().st_size > CODE_FILE_LIMIT:
-                continue
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    scan["visited"] += 1
+                    if (
+                        seen >= limit
+                        or scan["visited"] > 20_000
+                        or time.monotonic() >= deadline
+                    ):
+                        scan["truncated"] = True
+                        return
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name not in CODE_SKIP_DIRS:
+                                queue.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            path = Path(entry.path)
+                            if (
+                                _is_code_candidate(path)
+                                and entry.stat(follow_symlinks=False).st_size
+                                <= CODE_FILE_LIMIT
+                            ):
+                                seen += 1
+                                yield path
+                    except OSError:
+                        scan["truncated"] = True
         except OSError:
-            continue
-        seen += 1
-        yield path
+            scan["truncated"] = True
 
 
 def _read_utf8(path: Path) -> str | None:
@@ -1649,6 +1669,7 @@ def _scan_snakemake_structure(
 
 def _record_on_exit(pipeline_name: str, meta: dict):
     def cb(s: Session):
+        results.invalidate_inventory()
         terminal_job = _persist_session_terminal(s, reason="process exited")
         if not terminal_job or terminal_job.get("state") not in store.TERMINAL_STATES:
             return
@@ -1688,6 +1709,8 @@ def _session_job_payload(s: Session) -> dict:
     return {
         "title": s.title,
         "cores": _session_cores(s),
+        "memory_mb": int(s.meta.get("memory_mb") or 0),
+        "allow_parallel": bool(s.meta.get("allow_parallel", False)),
         "dryrun": bool(s.meta.get("dryrun")),
         "executor_state": s.status,
         "command": runplan.redact_command(s.argv),
@@ -2105,7 +2128,11 @@ def _run_queue_config() -> dict:
 
 
 def _run_core_budget() -> int:
-    return _run_queue_config()["max_cores"]
+    return _local_capacity()["max_cores"]
+
+
+def _local_capacity() -> dict:
+    return local_resources.policy(_run_queue_config(), local_resources.detect())
 
 
 def _session_cores(s: Session) -> int:
@@ -2119,7 +2146,7 @@ def _running_run_sessions() -> list[Session]:
     return [s for s in mgr.list() if s.kind == "run" and s.status == "running"]
 
 
-def _active_run_cores() -> int:
+def _active_resource_jobs() -> list[dict]:
     active = store.list_jobs(
         kind="run",
         executor="local",
@@ -2147,13 +2174,26 @@ def _active_run_cores() -> int:
             except Exception:
                 # On a persistence failure, keep reserving capacity conservatively.
                 active.append(job)
+    return active
+
+
+def _active_run_cores() -> int:
     total = 0
+    active = _active_resource_jobs()
     for job in active:
         try:
             total += max(1, int(job.get("cores") or 1))
         except (TypeError, ValueError):
             total += 1
     return total
+
+
+def _run_admission_reason(s: Session, budget: int) -> str:
+    capacity = _local_capacity()
+    capacity["max_cores"] = min(capacity["max_cores"], budget)
+    return local_resources.admission_reason(
+        {**s.meta, "cores": _session_cores(s)}, _active_resource_jobs(), capacity
+    )
 
 
 def _job_session_projection(job: dict) -> dict:
@@ -2355,6 +2395,8 @@ def _queued_run_sessions(*, restore: bool = False) -> list[Session]:
 
 
 def _run_queue_state() -> dict:
+    capacity = _local_capacity()
+    active_jobs = _active_resource_jobs()
     queued_jobs = store.list_jobs(
         kind="run",
         executor="local",
@@ -2366,6 +2408,9 @@ def _run_queue_state() -> dict:
     for i, job in enumerate(queued_jobs, 1):
         row = _job_session_projection(job)
         row.setdefault("meta", {})["queue_position"] = i
+        row["meta"]["queue_reason"] = local_resources.admission_reason(
+            job, active_jobs, capacity
+        )
         queued.append(row)
     running_jobs = store.list_jobs(
         kind="run",
@@ -2405,8 +2450,13 @@ def _run_queue_state() -> dict:
         )
         lost_rows.append(row)
     return {
-        "max_cores": _run_core_budget(),
+        **capacity,
         "active_cores": _active_run_cores(),
+        "active_memory_mb": sum(
+            int(job.get("memory_mb") or capacity["max_memory_mb"])
+            for job in active_jobs
+        ),
+        "monitor": local_resources.MONITOR.sample(active_jobs),
         "running": running,
         "queued": queued,
         "lost": lost_rows,
@@ -2452,6 +2502,8 @@ def _prepare_run_capsule(s: Session) -> bool:
             configfile=str(s.meta.get("configfile") or ""),
             profile=str(s.meta.get("profile") or ""),
             cores=_session_cores(s),
+            memory_mb=int(s.meta.get("memory_mb") or 0),
+            allow_parallel=bool(s.meta.get("allow_parallel", False)),
             dryrun=bool(s.meta.get("dryrun")),
             use_conda=bool(s.meta.get("use_conda", True)),
             extra=str(s.meta.get("extra") or ""),
@@ -2641,8 +2693,11 @@ def _schedule_queued_runs_under_lock() -> None:
         active = _active_run_cores()
         for s in _queued_run_sessions(restore=True):
             cores = _session_cores(s)
-            if active + cores > budget:
+            reason = _run_admission_reason(s, budget)
+            if active + cores > budget or reason:
+                s.meta["queue_reason"] = reason or "Waiting for CPU capacity"
                 continue
+            s.meta.pop("queue_reason", None)
             lease = store.acquire_job_lease(
                 s.id,
                 INSTANCE_ID,
@@ -2756,8 +2811,11 @@ async def _schedule_queued_runs_under_lock_async() -> None:
         active = _active_run_cores()
         for s in _queued_run_sessions(restore=True):
             cores = _session_cores(s)
-            if active + cores > budget:
+            reason = _run_admission_reason(s, budget)
+            if active + cores > budget or reason:
+                s.meta["queue_reason"] = reason or "Waiting for CPU capacity"
                 continue
+            s.meta.pop("queue_reason", None)
             lease = store.acquire_job_lease(
                 s.id,
                 INSTANCE_ID,
@@ -2824,6 +2882,7 @@ async def _schedule_queued_runs_under_lock_async() -> None:
 
 def _record_run_on_exit(pipeline_name: str, meta: dict):
     def cb(s: Session):
+        results.invalidate_inventory()
         # Capacity and the authoritative terminal state are released first.  A
         # capsule/history write failure must never strand the durable queue.
         terminal_job = _persist_session_terminal(s, reason="run process exited")
@@ -2985,6 +3044,8 @@ class RunRequest(BaseModel):
     configfile: str = ""
     profile: str = ""
     cores: int = 8
+    memory_mb: int = Field(default=0, ge=0)
+    allow_parallel: bool = True
     dryrun: bool = True
     use_conda: bool = True
     extra: str = ""
@@ -3132,6 +3193,8 @@ class BootstrapRequest(BaseModel):
 
 class RunQueueConfig(BaseModel):
     max_cores: int
+    max_memory_mb: int = Field(default=0, ge=0)
+    max_parallel: int = Field(default=2, ge=1, le=16)
 
 
 class JobCancelRequest(BaseModel):
@@ -3256,6 +3319,12 @@ def _submission_key(body: RunRequest) -> str:
 def _submission_request_digest(body: RunRequest, pipeline: str, executor: str) -> str:
     values = body.model_dump()
     values.pop("idempotency_key", None)
+    # Preserve replay compatibility for requests accepted before resource
+    # reservations existed; explicit allocations remain part of the contract.
+    if not values.get("memory_mb"):
+        values.pop("memory_mb", None)
+    if values.get("allow_parallel") is True:
+        values.pop("allow_parallel", None)
     canonical = json.dumps(
         {"pipeline": pipeline, "executor": executor, "request": values},
         sort_keys=True,
@@ -3411,23 +3480,29 @@ def _resolve_run_plan(
         require_explicit_study=require_explicit_study,
     )
     resolved_env = body.env or pipelines.resolve_env(pipeline) or ""
-    argv, human = pipelines.build_snakemake_argv(
-        pipeline,
-        target=body.target,
-        configfile=body.configfile,
-        profile=body.profile,
-        cores=body.cores,
-        dryrun=body.dryrun,
-        use_conda=body.use_conda,
-        extra=body.extra,
-        env=resolved_env,
-        resolve_default_env=False,
-    )
+    try:
+        argv, human = pipelines.build_snakemake_argv(
+            pipeline,
+            target=body.target,
+            configfile=body.configfile,
+            profile=body.profile,
+            cores=body.cores,
+            memory_mb=body.memory_mb if executor == "local" else 0,
+            dryrun=body.dryrun,
+            use_conda=body.use_conda,
+            extra=body.extra,
+            env=resolved_env,
+            resolve_default_env=False,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
     launch = {
         "target": body.target,
         "configfile": body.configfile,
         "profile": body.profile,
         "cores": body.cores,
+        "memory_mb": body.memory_mb if executor == "local" else 0,
         "dryrun": body.dryrun,
         "use_conda": body.use_conda,
         "env": resolved_env,
@@ -3483,9 +3558,11 @@ def _latest_mtime_limited(root: Path, max_files: int = 600) -> float | None:
     latest = root.stat().st_mtime
     seen = 0
     try:
-        for path in root.rglob("*"):
+        for path in results._walk_source(root, time.monotonic() + 0.5):
             if seen >= max_files:
                 break
+            if path is None:
+                continue
             try:
                 if path.is_file():
                     latest = max(latest, path.stat().st_mtime)
@@ -3536,9 +3613,12 @@ def _health_for_pipeline(
 ) -> dict:
     hist = store.history(p.name, limit=1)
     diag = {"error": None, "warning": None, "info": None}
+    diagnostics_scan = {"truncated": True}
     if include_diagnostics:
         try:
-            diag = code_diagnostics(p.name, limit=160)["summary"]
+            diagnostic_report = code_diagnostics(p.name, limit=160)
+            diag = diagnostic_report["summary"]
+            diagnostics_scan = diagnostic_report.get("scan", {"truncated": True})
         except Exception:
             diag = {"error": None, "warning": None, "info": None}
     git = git_ops.status(p.path)
@@ -3562,6 +3642,7 @@ def _health_for_pipeline(
         "last_run": hist[0] if hist else None,
         "run_state": run_state,
         "diagnostics": diag,
+        "diagnostics_scan": diagnostics_scan,
         "configs": len(p.configs) + len(p.project_local) + len(p.test_configs),
         "env_resolved": pipelines.resolve_env(p),
         "result_freshness": freshness,
@@ -5105,14 +5186,17 @@ def fleet_health(diagnostics: bool = True):
 
 
 @app.get("/api/pipelines/{name}")
-def pipeline_detail(name: str):
+def pipeline_detail(name: str, summary: bool = False):
     p = _require_pipeline(name)
     d = p.to_dict()
-    d["git"] = git_ops.status(p.path)
-    d["worktrees"] = git_ops.list_worktrees(p.path)
     d["history"] = [
         _public_history_entry(entry) for entry in store.history(name, limit=25)
     ]
+    if summary:
+        d["summary_only"] = True
+        return d
+    d["git"] = git_ops.status(p.path)
+    d["worktrees"] = git_ops.list_worktrees(p.path)
     d["available_envs"] = pipelines.real_envs()
     d["snakemake_envs"] = pipelines.snakemake_envs()
     d["env_resolved"] = pipelines.resolve_env(p)
@@ -5129,8 +5213,22 @@ def pipeline_health(name: str, diagnostics: bool = True):
 
 
 @app.get("/api/pipelines/{name}/results")
-def pipeline_results(name: str):
-    return results.gather(_require_pipeline(name))
+def pipeline_results(
+    name: str,
+    offset: int = 0,
+    page_size: int = 60,
+    kind: str = "all",
+    q: str = "",
+    refresh: bool = False,
+):
+    return results.page(
+        _require_pipeline(name),
+        offset=offset,
+        page_size=page_size,
+        kind=kind,
+        query=q,
+        refresh=refresh,
+    )
 
 
 @app.post("/api/pipelines/{name}/results/directories/search")
@@ -5723,24 +5821,16 @@ def pipeline_files(name: str, q: str = "", limit: int = 800):
     needle = q.strip().lower()
     limit = max(1, min(limit, CODE_LIST_LIMIT))
     files: list[dict] = []
+    scan: dict = {}
     try:
-        candidates = root.rglob("*")
+        candidates = _iter_code_files(root, limit=20_000, scan=scan)
         for path in candidates:
             if len(files) >= limit:
+                scan["truncated"] = True
                 break
             try:
-                rel_parts = path.relative_to(root).parts
-            except ValueError:
-                continue
-            if any(part in CODE_SKIP_DIRS for part in rel_parts[:-1]):
-                continue
-            try:
-                if not path.is_file() or not _is_code_candidate(path):
-                    continue
                 resolved = path.resolve()
                 if root not in resolved.parents and resolved != root:
-                    continue
-                if path.stat().st_size > CODE_FILE_LIMIT:
                     continue
                 rel = path.relative_to(root).as_posix()
             except OSError:
@@ -5751,7 +5841,7 @@ def pipeline_files(name: str, q: str = "", limit: int = 800):
     except OSError:
         pass
     files.sort(key=lambda f: (f["path"].count("/"), f["path"].lower()))
-    return {"files": files, "limit": limit, "max_size": CODE_FILE_LIMIT}
+    return {"files": files, "limit": limit, "max_size": CODE_FILE_LIMIT, "scan": scan}
 
 
 @app.get("/api/pipelines/{name}/code")
@@ -5979,8 +6069,10 @@ def code_diagnostics(name: str, limit: int = 120):
             )
 
     scanned = 0
-    for path in _iter_code_files(root):
+    scan: dict = {}
+    for path in _iter_code_files(root, scan=scan):
         if len(items) >= limit:
+            scan["truncated"] = True
             break
         rel = path.relative_to(root).as_posix()
         scanned += 1
@@ -6008,6 +6100,7 @@ def code_diagnostics(name: str, limit: int = 120):
         "items": items,
         "summary": summary,
         "scanned": scanned,
+        "scan": scan,
         "rules": len(rule_seen),
         "limit": limit,
     }
@@ -6586,7 +6679,9 @@ async def run_queue_set(body: RunQueueConfig):
         raise HTTPException(400, "max_cores must be at least 1")
     if body.max_cores > 1024:
         raise HTTPException(400, "max_cores is unreasonably high")
-    store.set_run_queue_config(body.max_cores)
+    store.set_run_queue_config(
+        body.max_cores, max_memory_mb=body.max_memory_mb, max_parallel=body.max_parallel
+    )
     _maybe_start_queued_runs()
     return _run_queue_state()
 
@@ -6762,6 +6857,11 @@ async def start_run(name: str, body: RunRequest):
         )
     if body.cores < 1:
         raise HTTPException(400, "cores must be at least 1")
+    if body.memory_mb and body.memory_mb > _local_capacity()["max_memory_mb"]:
+        raise HTTPException(
+            400,
+            "requested memory exceeds the detected local memory budget; preview a smaller allocation",
+        )
     plan, human, study_report, override_valid, resolved_env = await _await_blocking(
         _resolve_run_plan,
         p,
@@ -6787,6 +6887,8 @@ async def start_run(name: str, body: RunRequest):
         "dryrun": body.dryrun,
         "human": runplan.redact_command(plan.argv),
         "cores": body.cores,
+        "memory_mb": body.memory_mb,
+        "allow_parallel": body.allow_parallel,
         "target": body.target,
         "configfile": body.configfile,
         "profile": body.profile,
@@ -7782,7 +7884,7 @@ def help_catalog():
 
 
 @app.get("/api/meta")
-def meta():
+def meta(summary: bool = False):
     tools = {k: bool(shutil.which(v["exe"])) for k, v in settings.AGENT_TOOLS.items()}
     tools["github"] = bool(shutil.which("gh"))
     sra_tools = _sra_geo_tools()
@@ -7802,7 +7904,7 @@ def meta():
         },
         "tools": tools,
         "conda": pipelines._conda_exe(),
-        "envs": pipelines.real_envs(),
+        "envs": [] if summary else pipelines.real_envs(),
         "run_queue": _run_queue_state(),
         "durability": {
             "database": database,

@@ -1983,6 +1983,11 @@ def build(
         },
         "resources": {
             "cores": max(1, int(launch.get("cores", 1) or 1)),
+            **(
+                {"memory_mb": int(launch["memory_mb"])}
+                if launch.get("memory_mb")
+                else {}
+            ),
             "slurm": scheduler_payload,
         },
         "command": {

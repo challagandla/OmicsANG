@@ -45,11 +45,28 @@ def run_queue_config(default_max_cores: int) -> dict:
         max_cores = max(1, int((cfg or {}).get("max_cores", default_max_cores)))
     except (AttributeError, TypeError, ValueError):
         max_cores = default_max_cores
-    return {"max_cores": max_cores}
+
+    def positive_setting(name: str, default: int) -> int:
+        try:
+            return max(0, int((cfg or {}).get(name, default)))
+        except (AttributeError, TypeError, ValueError):
+            return default
+
+    return {
+        "max_cores": max_cores,
+        "max_memory_mb": positive_setting("max_memory_mb", 0),
+        "max_parallel": max(1, min(16, positive_setting("max_parallel", 2))),
+    }
 
 
-def set_run_queue_config(max_cores: int) -> dict:
-    saved = {"max_cores": max(1, int(max_cores))}
+def set_run_queue_config(
+    max_cores: int, *, max_memory_mb: int = 0, max_parallel: int = 2
+) -> dict:
+    saved = {
+        "max_cores": max(1, int(max_cores)),
+        "max_memory_mb": max(0, int(max_memory_mb)),
+        "max_parallel": max(1, min(16, int(max_parallel))),
+    }
     state_db.set_configuration("run_queue", saved)
     return saved
 
