@@ -307,7 +307,10 @@ def _path_options(pipeline: Pipeline, relpath: str, key: str, value) -> list[dic
             options[rel] = item_kind
 
     if current:
-        candidate = Path(current).expanduser()
+        try:
+            candidate = Path(current).expanduser()
+        except RuntimeError:  # "~name" for an unknown user, e.g. an R formula
+            candidate = Path(current)
         if not candidate.is_absolute():
             for base in (root, root / relpath):
                 target = (base.parent if base.is_file() else base) / candidate

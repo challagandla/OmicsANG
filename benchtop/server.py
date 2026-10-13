@@ -927,8 +927,19 @@ def _looks_checkable_path(key: str, value: str) -> bool:
     return bool(PATH_KEY_RE.search(key) or PATH_VALUE_RE.search(value))
 
 
+def _expand_config_path(raw_value: str) -> Path | None:
+    """Expand ``~``/``~user`` or return None for unknown users (e.g. R formulas
+    such as ``~condition``), which pathlib reports as a RuntimeError."""
+    try:
+        return Path(raw_value).expanduser()
+    except RuntimeError:
+        return None
+
+
 def _path_exists_for_config(root: Path, config_path: Path, raw_value: str) -> bool:
-    candidate = Path(raw_value).expanduser()
+    candidate = _expand_config_path(raw_value)
+    if candidate is None:
+        return True
     if candidate.is_absolute():
         return candidate.exists()
     return (root / candidate).exists() or (config_path.parent / candidate).exists()
@@ -949,8 +960,8 @@ def _safe_missing_rel(root: Path, base: Path, raw_value: str) -> str | None:
         return None
     if any(token in value for token in ("{", "}", "$", "*", "?", "\n")):
         return None
-    candidate = Path(value).expanduser()
-    if candidate.is_absolute():
+    candidate = _expand_config_path(value)
+    if candidate is None or candidate.is_absolute():
         return None
     target = (base / candidate).resolve()
     root = root.resolve()
@@ -1384,16 +1395,38 @@ def _scan_yaml_paths(root: Path, path: Path, rel: str, items: list[dict]) -> Non
     walk(data, "")
 
 
+_BAD_DIRECTIVE_RE = re.compile(r"^(thread|resource|logs|benchmarks)\s*:")
+_CONDA_REF_RE = re.compile(r"\bconda\s*:\s*[\"']([^\"']+\.ya?ml)[\"']")
+_INCLUDE_REF_RE = re.compile(r"\binclude\s*:\s*[\"']([^\"']+)[\"']")
+_OUTPUT_DIRECTIVE_RE = re.compile(r"^(output|log|benchmark)\s*:")
+_HOST_ABSOLUTE_RE = re.compile(r"[\"']/(?:home|media|mnt|tmp|var)/")
+# One combined search rejects the common risk-free line (and file) before
+# trying each shell-risk pattern separately.
+_SHELL_RISK_ANY_RE = re.compile(
+    "|".join(f"(?:{pattern.pattern})" for pattern, _, _ in SHELL_RISK_PATTERNS)
+)
+
+
 def _scan_text_diagnostics(root: Path, path: Path, rel: str, items: list[dict]) -> None:
     text = _read_utf8(path)
     if text is None:
         return
     lang = _code_language(path)
+    workflow_checks = lang in {"snakemake", "python"}
+    risk_checks = lang in {
+        "snakemake",
+        "shell",
+        "python",
+        "r",
+    } and bool(_SHELL_RISK_ANY_RE.search(text))
+    if not workflow_checks and not risk_checks:
+        return
     lines = text.splitlines()
     for i, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if lang in {"snakemake", "python"}:
-            m = re.match(r"^(thread|resource|logs|benchmarks)\s*:", stripped)
+        # Every workflow check below matches a "directive:" form.
+        if workflow_checks and ":" in line:
+            stripped = line.strip()
+            m = _BAD_DIRECTIVE_RE.match(stripped)
             if m:
                 bad = m.group(1)
                 good = DIRECTIVE_FIXES[bad]
@@ -1417,7 +1450,7 @@ def _scan_text_diagnostics(root: Path, path: Path, rel: str, items: list[dict]) 
                         ],
                     )
                 )
-            conda = re.search(r"\bconda\s*:\s*[\"']([^\"']+\.ya?ml)[\"']", line)
+            conda = _CONDA_REF_RE.search(line)
             if conda:
                 ref = conda.group(1)
                 if not (root / ref).exists() and not (path.parent / ref).exists():
@@ -1433,7 +1466,7 @@ def _scan_text_diagnostics(root: Path, path: Path, rel: str, items: list[dict]) 
                             _missing_path_fixes(root, path.parent, "conda", ref),
                         )
                     )
-            include = re.search(r"\binclude\s*:\s*[\"']([^\"']+)[\"']", line)
+            include = _INCLUDE_REF_RE.search(line)
             if include:
                 ref = include.group(1)
                 if not (root / ref).exists() and not (path.parent / ref).exists():
@@ -1449,9 +1482,7 @@ def _scan_text_diagnostics(root: Path, path: Path, rel: str, items: list[dict]) 
                             _missing_path_fixes(root, path.parent, "include", ref),
                         )
                     )
-            if re.match(r"^(output|log|benchmark)\s*:", stripped) and re.search(
-                r"[\"']/(?:home|media|mnt|tmp|var)/", line
-            ):
+            if _OUTPUT_DIRECTIVE_RE.match(stripped) and _HOST_ABSOLUTE_RE.search(line):
                 items.append(
                     _diagnostic(
                         "warning",
@@ -1462,7 +1493,7 @@ def _scan_text_diagnostics(root: Path, path: Path, rel: str, items: list[dict]) 
                         "absolute-output",
                     )
                 )
-        if lang in {"snakemake", "shell", "python", "r"}:
+        if risk_checks and _SHELL_RISK_ANY_RE.search(line):
             for pattern, title, message in SHELL_RISK_PATTERNS:
                 if pattern.search(line):
                     items.append(
@@ -6070,6 +6101,7 @@ def code_diagnostics(name: str, limit: int = 120):
 
     scanned = 0
     scan: dict = {}
+    core_budget: int | None = None
     for path in _iter_code_files(root, scan=scan):
         if len(items) >= limit:
             scan["truncated"] = True
@@ -6086,9 +6118,9 @@ def code_diagnostics(name: str, limit: int = 120):
         _scan_sample_sheet_fastqs(root, path, rel, items)
         _scan_text_diagnostics(root, path, rel, items)
         if _code_language(path) == "snakemake":
-            _scan_snakemake_structure(
-                root, path, rel, items, rule_seen, _run_core_budget()
-            )
+            if core_budget is None:  # detection reads /proc and cgroups
+                core_budget = _run_core_budget()
+            _scan_snakemake_structure(root, path, rel, items, rule_seen, core_budget)
 
     items = items[:limit]
     summary = {

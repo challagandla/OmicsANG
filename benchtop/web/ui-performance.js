@@ -56,7 +56,23 @@
     };
   }
 
-  const api = { createDisplayCache, createPoller };
+  // Each attached terminal keeps an xterm buffer and a WebSocket open. Release
+  // the focused or live ones never; release terminals the server no longer
+  // lists, and keep only the most recently used `keep` ended ones.
+  function terminalsToRelease(records, { focused, listed, keep = 6 }) {
+    const release = [];
+    const ended = [];
+    for (const [id, rec] of records) {
+      if (id === focused) continue;
+      if (!listed.has(id)) release.push(id);
+      else if (rec.exited) ended.push([id, rec.usedAt || 0]);
+    }
+    ended.sort((a, b) => b[1] - a[1]);
+    for (const [id] of ended.slice(keep)) release.push(id);
+    return release;
+  }
+
+  const api = { createDisplayCache, createPoller, terminalsToRelease };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.OmicsPerformance = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

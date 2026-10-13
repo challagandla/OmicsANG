@@ -109,10 +109,10 @@ integration.
 ## Recommended installation with pip and venv
 
 Download and extract an OmicsANG release source archive, then enter its top-level
-directory. For the `0.2.2` source archive, the complete installation is:
+directory. For the `0.2.3` source archive, the complete installation is:
 
 ```bash
-cd omicsang-0.2.2
+cd omicsang-0.2.3
 python3 -m venv "$HOME/.venvs/omicsang"
 . "$HOME/.venvs/omicsang/bin/activate"
 python -m pip install --upgrade pip
@@ -122,11 +122,11 @@ omicsang --version
 
 The installed CLI and web assets no longer depend on that source directory.
 Keep the virtual environment activated when using the commands in the tutorial.
-If you downloaded the `0.2.2` wheel into the current directory, it can be
+If you downloaded the `0.2.3` wheel into the current directory, it can be
 installed in the same environment instead:
 
 ```bash
-python -m pip install ./omicsang-0.2.2-py3-none-any.whl
+python -m pip install ./omicsang-0.2.3-py3-none-any.whl
 ```
 
 Use a fresh virtual environment for the rename. Do not install OmicsANG into an

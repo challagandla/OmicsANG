@@ -142,6 +142,8 @@ jobs:
           if actual != expected:
               raise SystemExit(f"release tag {actual!r} does not match {expected!r}")
           PY
+      - name: Read package version
+        run: echo "OMICSANG_VERSION=$(python -c 'from omicsang import __version__; print(__version__)')" >> "$GITHUB_ENV"
       - name: Build wheel and source distribution
         run: python -m build
       - name: Validate metadata and manifests
@@ -152,22 +154,24 @@ jobs:
       - name: Inspect archive contents
         run: |
           python - <<'PY'
+          import os
           from pathlib import Path
           import tarfile
           from zipfile import ZipFile
 
+          release = os.environ["OMICSANG_VERSION"]
           expected_artifacts = {
-              "omicsang-0.2.1-py3-none-any.whl",
-              "omicsang-0.2.1.tar.gz",
+              f"omicsang-{release}-py3-none-any.whl",
+              f"omicsang-{release}.tar.gz",
           }
           artifacts = {path.name for path in Path("dist").iterdir() if path.is_file()}
           if artifacts != expected_artifacts:
               raise SystemExit(
-                  f"expected OmicsANG 0.2.1 artifacts {sorted(expected_artifacts)}; "
+                  f"expected OmicsANG {release} artifacts {sorted(expected_artifacts)}; "
                   f"found {sorted(artifacts)}"
               )
 
-          wheel = Path("dist/omicsang-0.2.1-py3-none-any.whl")
+          wheel = Path(f"dist/omicsang-{release}-py3-none-any.whl")
           with ZipFile(wheel) as archive:
               names = set(archive.namelist())
           required = {
@@ -178,6 +182,7 @@ jobs:
               "benchtop/web/editor-core.js",
               "benchtop/web/index.html",
               "benchtop/web/styles.css",
+              "benchtop/web/ui-performance.js",
               "benchtop/web/vendor/xterm/5.3.0/xterm.js",
               "benchtop/web/vendor/xterm/5.3.0/xterm.css",
               "benchtop/web/vendor/xterm-addon-fit/0.8.0/xterm-addon-fit.js",
@@ -193,7 +198,7 @@ jobs:
               raise SystemExit(f"missing={missing}; forbidden={forbidden}")
           print(f"validated {len(names)} wheel members")
 
-          sdist = Path("dist/omicsang-0.2.1.tar.gz")
+          sdist = Path(f"dist/omicsang-{release}.tar.gz")
           with tarfile.open(sdist, "r:gz") as archive:
               source_names = {member.name for member in archive.getmembers() if member.isfile()}
           required_suffixes = {
@@ -230,21 +235,29 @@ jobs:
           PY
       - name: Install and inspect wheel outside the checkout
         run: |
-          wheel="dist/omicsang-0.2.1-py3-none-any.whl"
+          wheel="dist/omicsang-${OMICSANG_VERSION}-py3-none-any.whl"
           python -m venv "${RUNNER_TEMP}/omicsang-wheel"
           "${RUNNER_TEMP}/omicsang-wheel/bin/python" -m pip install "${wheel}"
           cd "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/omicsang-wheel/bin/python" - <<'PY'
+          import os
           from importlib.metadata import version
           from importlib.resources import files
 
           import omicsang
           import benchtop.server
 
-          assert omicsang.__version__ == "0.2.1"
-          assert version("omicsang") == "0.2.1"
+          release = os.environ["OMICSANG_VERSION"]
+          assert omicsang.__version__ == release
+          assert version("omicsang") == release
           web = files(benchtop.server.__package__).joinpath("web")
-          for relative in ("index.html", "app.js", "editor-core.js", "styles.css"):
+          for relative in (
+              "index.html",
+              "app.js",
+              "editor-core.js",
+              "styles.css",
+              "ui-performance.js",
+          ):
               assert web.joinpath(relative).is_file(), relative
           print("installed server and static resources are importable")
           PY

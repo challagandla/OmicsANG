@@ -508,9 +508,10 @@ def _walk_source(
                         continue
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            child = Path(entry.path).resolve(strict=True)
-                            if _inside(root, child):
-                                queue.append(child)
+                            # ``current`` is canonical and the entry is not a
+                            # symlink, so its path is canonical too; skipping
+                            # realpath avoids one lstat per path component.
+                            queue.append(Path(entry.path))
                             yield None
                         elif entry.is_file(follow_symlinks=False):
                             yield Path(entry.path)
@@ -562,6 +563,22 @@ def _gather_sources(
         active.append((source, iterator))
         if path is None:
             continue
+        # Classify by name first: most outputs (BAM, FASTQ, bigWig, ...) are
+        # never displayed, so they should not cost a realpath and stat each.
+        suffix = path.suffix.lower()
+        category: list[dict[str, Any]] | None = None
+        if path.name in _REPORT_HINTS or (
+            suffix == ".html" and "report" in path.name.lower()
+        ):
+            category = reports
+        elif suffix in _IMG:
+            category = images
+        elif suffix == ".ipynb":
+            category = notebooks
+        elif suffix in _TABLE:
+            category = tables
+        if category is None:
+            continue
         root = Path(source["path"])
         try:
             actual = path.resolve(strict=True)
@@ -576,20 +593,6 @@ def _gather_sources(
         except (OSError, RuntimeError, ValueError):
             continue
         if any(part in _SKIP_DIRS for part in Path(relative).parts[:-1]):
-            continue
-        suffix = path.suffix.lower()
-        category: list[dict[str, Any]] | None = None
-        if path.name in _REPORT_HINTS or (
-            suffix == ".html" and "report" in path.name.lower()
-        ):
-            category = reports
-        elif suffix in _IMG:
-            category = images
-        elif suffix == ".ipynb":
-            category = notebooks
-        elif suffix in _TABLE:
-            category = tables
-        if category is None:
             continue
         seen_files.add(actual)
         entry: dict[str, Any] = {

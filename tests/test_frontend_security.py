@@ -51,7 +51,7 @@ class FrontendSecurityContractTests(unittest.TestCase):
         xterm_position = self.index_source.index(
             '<script src="/vendor/xterm/5.3.0/xterm.js">'
         )
-        app_position = self.index_source.index("/app.js?v=20260716-restore")
+        app_position = self.index_source.index("/app.js?v=20261013")
         self.assertLess(auth_position, xterm_position)
         self.assertLess(auth_position, app_position)
         self.assertIn("window.history.replaceState(", self.auth_source)
