@@ -201,7 +201,7 @@ const lightbox = $('#lightbox');
 const viewSettings = $('#view-settings');
 const helpDrawer = $('#help-drawer');
 const helpBackdrop = $('#help-backdrop');
-const terminals = new Map();   // sid -> { term, fit, ws, host, session, exited }
+const terminals = new Map();   // sid -> { term, fit, ws, host, session, exited, usedAt }
 
 function el(tag, attrs = {}, ...kids) {
   const e = document.createElement(tag);
@@ -6896,6 +6896,7 @@ function viewTerminal(view) {
     return;
   }
   const rec = terminals.get(sid);
+  rec.usedAt = Date.now();
   const s = state.sessions.find(x => x.id === sid) || rec.session;
   rec.session = s;
   const status = s.status || (rec.exited ? 'exited' : 'running');
@@ -6950,7 +6951,7 @@ function openTerminal(session) {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}/ws/term/${session.id}`);
     ws.binaryType = 'arraybuffer';
-    const rec = { term, fit, ws, host, session, exited: false };
+    const rec = { term, fit, ws, host, session, exited: false, usedAt: Date.now() };
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
         try { const m = JSON.parse(ev.data);
@@ -6979,6 +6980,20 @@ function fitTerminal(sid) {
   try { rec.fit.fit(); rec.sendResize(); rec.term.focus(); } catch (e) {}
 }
 window.addEventListener('resize', () => { if (state.tab === 'terminal' && state.focusedSession) fitTerminal(state.focusedSession); });
+
+function releaseIdleTerminals() {
+  const release = window.OmicsPerformance.terminalsToRelease(terminals, {
+    focused: state.focusedSession,
+    listed: new Set(state.sessions.map(s => s.id)),
+  });
+  for (const sid of release) {
+    const rec = terminals.get(sid);
+    terminals.delete(sid);
+    try { rec.ws.close(); } catch (e) {}
+    try { rec.term.dispose(); } catch (e) {}
+    rec.host.remove();
+  }
+}
 
 async function debugWithClaude(sessionId) {
   try {
@@ -7049,6 +7064,7 @@ async function updateSessions() {
         onclick: (e) => { e.stopPropagation(); debugWithClaude(s.id); } }, ' ✦'));
     wrap.append(chip);
   }
+  releaseIdleTerminals();
   renderMonitor();
 }
 

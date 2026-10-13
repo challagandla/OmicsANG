@@ -10,10 +10,12 @@ Everything is defensive: a malformed file is skipped, never fatal.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import time
 from collections import deque
-from fnmatch import fnmatch
+from fnmatch import fnmatch, translate
 from pathlib import Path
 
 from . import results
@@ -25,6 +27,21 @@ QC_SCAN_VISITED = 100_000
 
 class _FileInventory(list[Path]):
     """Marker for a bounded, source-safe scan shared by all QC collectors."""
+
+
+# Every file name any collector parses; the scan keeps only these so that the
+# per-file checks run only on files a collector parses, not on every output.
+QC_PATTERNS = (
+    "multiqc_general_stats.txt",
+    "*.fastp.json",
+    "*log.final.out",
+    "*flagstat*",
+    "*.summary",
+    "*.narrowpeak",
+    "*.broadpeak",
+    "*peaks.bed",
+)
+_QC_NAME_RE = re.compile("|".join(translate(p) for p in QC_PATTERNS))
 
 
 def _scan_files(roots) -> _FileInventory:
@@ -48,16 +65,19 @@ def _scan_files(roots) -> _FileInventory:
             continue
         active.append(iterator)
         visited += 1
-        if path is None:
+        if path is None or not _QC_NAME_RE.match(path.name.lower()):
             continue
+        # The walker only yields non-symlink entries below a resolved root, so
+        # the path is already canonical; one lstat confirms a regular file.
         try:
-            resolved = path.resolve(strict=True)
-        except (OSError, RuntimeError):
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
+        except OSError:
             continue
-        if resolved in seen_files or not resolved.is_file():
+        if path in seen_files:
             continue
-        seen_files.add(resolved)
-        files.append(resolved)
+        seen_files.add(path)
+        files.append(path)
     return files
 
 
@@ -68,8 +88,6 @@ def _iter(roots, patterns, limit=500):
     for f in inventory:
         if len(out) >= limit:
             return out
-        if f.is_symlink():
-            continue
         n = f.name.lower()
         if any(fnmatch(n, pat) for pat in pats):
             out.append(f)

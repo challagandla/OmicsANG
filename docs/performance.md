@@ -20,16 +20,27 @@ nested changes made outside OmicsANG are picked up on expiry or Refresh. Result
 sources are reauthorized on every page request and files are authorized again when
 opened. Cached inventories are never used for provenance or execution.
 
+Result and QC scans classify files by name before touching them, so large
+non-displayed outputs (BAM, FASTQ, bigWig, ...) cost one directory entry each
+rather than a path resolution and `stat`. Only displayable files, and only the
+file names a QC parser reads, are verified as regular files inside their source.
+
 An inventory is limited to 4,000 recognized outputs and a two-second scan, with
 additional per-source bounds. A partial inventory is labelled explicitly; attach a
 narrower output directory when a large result tree exceeds the bounds. Diagnostic
 scans also report when their file, entry, or time limits are reached. These are
 browsing limits, not scientific validation results.
 
+Code diagnostics skip per-line checks a file cannot trigger (for example, a file
+without any shell-risk command), and detect local CPU capacity once per scan.
+
 Session polling waits until its preceding requests finish. Visible tabs poll every
 2.5 seconds while sessions or queued runs are active and every 15 seconds when
 idle. Hidden tabs schedule no polls; returning to a tab refreshes immediately.
 An already-running request is allowed to finish when the tab becomes hidden.
+Terminals whose sessions have ended are released (xterm buffer and WebSocket)
+after the six most recently viewed; the focused terminal and live sessions are
+never released. Reopening a released session re-attaches to it.
 
 For regression checks, run:
 

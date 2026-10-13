@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-from benchtop import pipelines, results, server, settings
+from benchtop import pipelines, qc, results, server, settings
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -116,6 +116,43 @@ class DisplayPerformanceTest(unittest.TestCase):
         self.assertEqual(match["pagination"]["total"], 1)
         self.assertEqual(match["images"][0]["name"], "plot-224.png")
         self.assertFalse(pages[-1]["pagination"]["has_more"])
+
+    def test_scans_check_only_files_they_can_display_or_parse(self):
+        (self.outputs / "plot.png").write_bytes(b"png")
+        (self.outputs / "s1.flagstat").write_text(
+            "10 + 0 in total\n9 + 0 mapped (90.00% : N/A)\n"
+        )
+        for i in range(50):
+            (self.outputs / f"reads-{i}.bam").write_bytes(b"bam")
+        real_resolve = Path.resolve
+        resolved = []
+
+        def resolve(path, *args, **kwargs):
+            resolved.append(path.name)
+            return real_resolve(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", resolve):
+            inventory = results.page(self.pipeline, refresh=True)
+            report = qc.gather(self.pipeline)
+        self.assertEqual(inventory["counts"]["images"], 1)
+        self.assertEqual([panel["id"] for panel in report["panels"]], ["flagstat"])
+        self.assertFalse([name for name in resolved if name.endswith(".bam")])
+
+    def test_qc_scan_skips_symlinked_files(self):
+        outside = self.root / "outside.flagstat"
+        outside.write_text("10 + 0 in total\n9 + 0 mapped (90.00% : N/A)\n")
+        (self.outputs / "leak.flagstat").symlink_to(outside)
+        self.assertEqual(qc.gather(self.pipeline)["panels"], [])
+
+    def test_diagnostics_tolerate_tilde_values_that_are_not_paths(self):
+        (self.checkout / "Snakefile").write_text("rule all:\n    input: []\n")
+        config = self.checkout / "config"
+        config.mkdir()
+        (config / "config.yaml").write_text(
+            'deseq2:\n  design: "~condition"\nresults_dir: "~nosuchuser_omicsang/x"\n'
+        )
+        report = server.code_diagnostics("pipe")
+        self.assertIn("summary", report)
 
     def test_nested_changes_refresh_and_expire(self):
         nested = self.outputs / "nested"
@@ -230,6 +267,28 @@ const {createDisplayCache, createPoller} = require('./benchtop/web/ui-performanc
   assert.equal(timers.size, 1); assert.equal([...timers.values()][0].ms, 2500);
   visible = false; poller.visibilityChanged(); assert.equal(timers.size, 0);
 })().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        completed = subprocess.run(
+            ["node", "-e", script], cwd=REPO, capture_output=True, text=True, timeout=20
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+    def test_idle_terminals_are_released_but_focused_and_live_are_kept(self):
+        script = r"""
+const assert = require('node:assert/strict');
+const {terminalsToRelease} = require('./benchtop/web/ui-performance.js');
+const records = new Map([
+  ['focused', {exited: true, usedAt: 1}],
+  ['live', {exited: false, usedAt: 2}],
+  ['gone', {exited: false, usedAt: 3}],
+  ['old', {exited: true, usedAt: 4}],
+  ['recent', {exited: true, usedAt: 9}],
+  ['middle', {exited: true, usedAt: 6}],
+]);
+const listed = new Set(['focused', 'live', 'old', 'recent', 'middle']);
+const release = terminalsToRelease(records, {focused: 'focused', listed, keep: 2});
+assert.deepEqual(release.sort(), ['gone', 'old']);
+assert.deepEqual(terminalsToRelease(records, {focused: 'gone', listed, keep: 6}), []);
 """
         completed = subprocess.run(
             ["node", "-e", script], cwd=REPO, capture_output=True, text=True, timeout=20

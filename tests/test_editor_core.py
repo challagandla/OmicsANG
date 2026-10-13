@@ -20,7 +20,7 @@ class EditorAssetContractTests(unittest.TestCase):
         source = INDEX_HTML.read_text(encoding="utf-8")
         self.assertLess(
             source.index("/editor-core.js?v=20260716-restore"),
-            source.index("/app.js?v=20260716-restore"),
+            source.index("/app.js?v=20261013"),
         )
         self.assertIn("window.OmicsEditorCore", APP_JS.read_text(encoding="utf-8"))
 
