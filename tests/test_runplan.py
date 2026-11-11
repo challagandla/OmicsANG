@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -218,6 +219,19 @@ class RunPlanTest(unittest.TestCase):
         self.assertEqual(record["digest_scope"], "private-canonical-plan")
         self.assertTrue(record["redacted"])
         self.assertNotEqual(record["digest"], record["projection_digest"])
+
+    def test_userinfo_redaction_is_linear_on_long_runs(self) -> None:
+        self.assertEqual(
+            runplan.redact_text("git@github.com:owner/repo.git"),
+            "<redacted>@github.com:owner/repo.git",
+        )
+        self.assertEqual(
+            runplan.redact_text("x=user@host:path"), "<redacted>@host:path"
+        )
+        pattern = runplan._REDACT_USERINFO_RE
+        started = time.perf_counter()
+        pattern.sub("<redacted>@", "!" * 200_000)
+        self.assertLess(time.perf_counter() - started, 1.0)
 
     def test_argv_redaction_preserves_multiword_secret_boundaries(self) -> None:
         argv = [
