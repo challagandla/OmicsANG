@@ -1601,8 +1601,10 @@ def _output_roots(pipeline: Pipeline, configfile: str) -> list[str]:
 
 
 # Anchor userinfo at a token boundary so a long run without "@" is tried once,
-# not from every offset (quadratic on input like "!!!...").
-_REDACT_USERINFO_RE = re.compile(r"(?i)(?<![^/@:\s])[^/@:\s]+@(?=[A-Za-z0-9.-]+:)")
+# not from every offset (quadratic on input like "!!!...").  The boundary is
+# consumed and restored rather than a lookbehind, which CodeQL cannot see as
+# an anchor.
+_REDACT_USERINFO_RE = re.compile(r"(^|[/@:\s])[^/@:\s]+@(?=[A-Za-z0-9.-]+:)")
 _REDACT_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.-]*)=(.*)$", re.S)
 _REDACT_HEADER_RE = re.compile(r"^([^:\s]+):\s*(.*)$", re.S)
 _REDACT_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/@\s]+@")
@@ -1625,7 +1627,7 @@ def redact_text(value: str) -> str:
 # the same historical argv and metadata strings on every poll.
 @functools.lru_cache(maxsize=16384)
 def _redact_text(text: str) -> str:
-    text = _REDACT_USERINFO_RE.sub("<redacted>@", text)
+    text = _REDACT_USERINFO_RE.sub(r"\1<redacted>@", text)
     assignment = _REDACT_ASSIGNMENT_RE.match(text)
     if assignment and SECRET_RE.search(assignment.group(1)):
         return assignment.group(1) + "=<redacted>"

@@ -230,7 +230,7 @@ class RunPlanTest(unittest.TestCase):
         )
         pattern = runplan._REDACT_USERINFO_RE
         started = time.perf_counter()
-        pattern.sub("<redacted>@", "!" * 200_000)
+        pattern.sub(r"\1<redacted>@", "!" * 200_000)
         self.assertLess(time.perf_counter() - started, 1.0)
 
     def test_argv_redaction_preserves_multiword_secret_boundaries(self) -> None:
