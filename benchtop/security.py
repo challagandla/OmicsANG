@@ -24,7 +24,7 @@ CSRF_HEADER = "x-benchtop-csrf"
 # Browsers cannot set headers on a WebSocket upgrade, so the page presents its
 # secret as an offered subprotocol and the server selects the fixed one.
 WS_SUBPROTOCOL = "omicsang.term.v1"
-WS_SECRET_PREFIX = "omicsang.csrf."
+WS_SECRET_PREFIX = "omicsang.csrf."  # pragma: allowlist secret
 MAX_REQUEST_BYTES = 2_000_000
 SESSION_TTL_SECONDS = 12 * 60 * 60
 # Extra one-time launch codes minted for the running server by `omicsang open`.

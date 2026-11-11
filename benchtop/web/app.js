@@ -1052,7 +1052,7 @@ function bootstrapTokenFromFragment() {
 // exchange is kept in sessionStorage, which is scoped to this exact origin
 // (including the port) and to this tab; other tabs of the same origin can ask
 // for it over a BroadcastChannel, which is same-origin by construction.
-const PAGE_SECRET_KEY = 'omicsang.page-secret';
+const PAGE_SECRET_KEY = 'omicsang.page-secret'; // pragma: allowlist secret
 const AUTH_CHANNEL = 'omicsang.auth.v1';
 let authChannel = null;
 
@@ -1076,7 +1076,7 @@ function pageSecretFromOtherTab(timeoutMs = 600) {
     const timer = setTimeout(() => finish(''), timeoutMs);
     channel.onmessage = (event) => {
       const data = event.data;
-      if (data && data.type === 'page-secret' && typeof data.secret === 'string' && data.secret) {
+      if (data && data.type === 'page-secret' && typeof data.secret === 'string' && data.secret) { // pragma: allowlist secret
         clearTimeout(timer);
         finish(data.secret);
       }

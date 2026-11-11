@@ -240,7 +240,6 @@ class BuildArgvTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_sandbox_usable(), "bubblewrap sandbox unavailable")
-@unittest.skipUnless(_sandbox_usable(), "bubblewrap sandbox unavailable")
 class ProviderConfigTests(unittest.TestCase):
     """Only the provider's live state is writable; what it executes is not."""
 
@@ -359,6 +358,8 @@ class GitDirectoryBindingTests(unittest.TestCase):
         return repo
 
     def _extra_binds(self, workdir: Path) -> list[str]:
+        if not _sandbox_usable():
+            self.skipTest("bubblewrap sandbox unavailable")
         argv = sandbox.build_argv(["/bin/true"], cwd=str(workdir), tool="claude")
         # Provider-config binds live under the fixture home, not this root.
         return [
@@ -415,6 +416,7 @@ class GitDirectoryBindingTests(unittest.TestCase):
         self.assertIsNone(sandbox._git_common_dir(self.main))
 
 
+@unittest.skipUnless(_sandbox_usable(), "bubblewrap sandbox unavailable")
 class RealContainmentTests(unittest.TestCase):
     """Prove the boundary against the kernel, not against our own argv builder."""
 
