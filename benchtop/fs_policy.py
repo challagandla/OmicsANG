@@ -4,12 +4,13 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
+import secrets
 import shutil
 import stat
-import tempfile
 import time
 from pathlib import Path, PurePosixPath
 
@@ -203,6 +204,40 @@ def resolve_relative(
     return rel, target
 
 
+def _open_directory_nofollow(path: Path, *, create: bool) -> int:
+    """Open *path* one component at a time, never traversing a symlink.
+
+    Checking a path for symlinks and then opening it by name leaves a window in
+    which a concurrent writer inside the repository can swap a component.  The
+    returned descriptor pins the directory that was actually verified.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        current = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        raise PathPolicyError("path is inaccessible") from exc
+    try:
+        for part in path.parts[1:]:
+            try:
+                child = os.open(part, flags, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, dir_fd=current)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=current)
+            os.close(current)
+            current = child
+    except OSError as exc:
+        os.close(current)
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PathPolicyError("symlink traversal is not accepted") from exc
+        raise PathPolicyError("path is inaccessible") from exc
+    return current
+
+
 def atomic_write_text(
     target: Path,
     content: str,
@@ -212,36 +247,61 @@ def atomic_write_text(
     """Replace UTF-8 text, preserving safe source modes or using ``0644`` new."""
     target = _lexical_absolute(target)
     _reject_symlink_components(target.parent)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _reject_symlink_components(target.parent)
+    # Every later step is relative to this descriptor, so nothing that happens
+    # to the path after verification can redirect the write.
+    parent_fd = _open_directory_nofollow(target.parent, create=True)
+    tmp_name = ""
+    fd = -1
     try:
-        info = target.lstat()
-    except FileNotFoundError:
-        write_mode = 0o644 if mode is None else mode
-    except OSError as exc:
-        raise PathPolicyError("write target is inaccessible") from exc
-    else:
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
-            raise PathPolicyError("write target is not an ordinary file")
-        write_mode = stat.S_IMODE(info.st_mode) if mode is None else mode
-    if write_mode < 0 or write_mode > 0o777:
-        raise ValueError("file mode must contain only ordinary permission bits")
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
-    tmp = Path(tmp_name)
-    try:
-        os.fchmod(fd, write_mode)
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, target)
-    except Exception:
         try:
-            os.close(fd)
-        except OSError:
-            pass
-        tmp.unlink(missing_ok=True)
-        raise
+            info = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            write_mode = 0o644 if mode is None else mode
+        except OSError as exc:
+            raise PathPolicyError("write target is inaccessible") from exc
+        else:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+                raise PathPolicyError("write target is not an ordinary file")
+            write_mode = stat.S_IMODE(info.st_mode) if mode is None else mode
+        if write_mode < 0 or write_mode > 0o777:
+            raise ValueError("file mode must contain only ordinary permission bits")
+        for _ in range(16):
+            tmp_name = f".{target.name}.{secrets.token_hex(8)}"
+            try:
+                fd = os.open(
+                    tmp_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise PathPolicyError("could not create a temporary file")
+        try:
+            os.fchmod(fd, write_mode)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                fd = -1
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(
+                tmp_name, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+            )
+        except Exception:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(parent_fd)
 
 
 def private_backup(root: Path, target: Path, *, namespace: str) -> str | None:

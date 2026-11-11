@@ -323,3 +323,21 @@ vm.runInContext(source.slice(start, end), context);
             ["node", "-e", script], cwd=REPO, capture_output=True, text=True, timeout=20
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+
+class StaticEntryPageCachingTests(unittest.TestCase):
+    def test_entry_page_is_revalidated_and_assets_keep_validators(self) -> None:
+        import os
+
+        files = server._WebFiles(directory=str(server.WEB_DIR), html=True)
+        scope = {"type": "http", "method": "GET", "headers": []}
+
+        def respond(name: str):
+            path = server.WEB_DIR / name
+            return files.file_response(str(path), os.stat(path), scope)
+
+        page = respond("index.html")
+        self.assertEqual(page.headers.get("cache-control"), "no-cache")
+        asset = respond("ui-performance.js")
+        self.assertIn("etag", asset.headers)
+        self.assertNotIn("cache-control", asset.headers)

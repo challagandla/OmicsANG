@@ -14,6 +14,7 @@ from typing import Any
 
 import yaml
 
+from . import yaml_io
 from .pipelines import Pipeline
 
 MAX_SHEET_BYTES = 8_000_000
@@ -167,7 +168,7 @@ def _load_config(path: Path | None) -> dict:
     if not path:
         return {}
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = yaml.safe_load(yaml_io.read_text(path))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}

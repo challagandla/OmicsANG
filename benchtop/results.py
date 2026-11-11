@@ -15,7 +15,7 @@ from typing import Any
 
 import yaml
 
-from . import fs_policy, settings, store
+from . import fs_policy, settings, store, yaml_io
 from .pipelines import Pipeline
 
 _IMG = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -110,7 +110,7 @@ def _source_record(
 def _configured_roots(pipeline: Pipeline) -> Iterator[Path]:
     for config in pipeline.configs:
         try:
-            data = yaml.safe_load((pipeline.path / config).read_text(encoding="utf-8"))
+            data = yaml_io.display_load(yaml_io.read_text(pipeline.path / config))
         except (OSError, UnicodeError, yaml.YAMLError):
             continue
         if not isinstance(data, dict) or not data.get("results_dir"):

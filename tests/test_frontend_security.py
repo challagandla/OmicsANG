@@ -51,7 +51,7 @@ class FrontendSecurityContractTests(unittest.TestCase):
         xterm_position = self.index_source.index(
             '<script src="/vendor/xterm/5.3.0/xterm.js">'
         )
-        app_position = self.index_source.index("/app.js?v=20261013")
+        app_position = self.index_source.index("/app.js?v=20261110")
         self.assertLess(auth_position, xterm_position)
         self.assertLess(auth_position, app_position)
         self.assertIn("window.history.replaceState(", self.auth_source)
@@ -60,6 +60,17 @@ class FrontendSecurityContractTests(unittest.TestCase):
         self.assertNotIn("localStorage", self.auth_source)
         self.assertNotIn("sessionStorage", self.auth_source)
         self.assertIn("window.__benchtopTakeBootstrapToken", self.source)
+
+    def test_page_secret_is_origin_scoped_and_required_for_terminals(self) -> None:
+        # localStorage would outlive the tab; the secret stays in sessionStorage
+        # and is never recovered from the server with the cookie alone.
+        self.assertIn(
+            "window.sessionStorage.setItem(PAGE_SECRET_KEY, value)", self.source
+        )
+        self.assertNotIn("localStorage.setItem(PAGE_SECRET_KEY", self.source)
+        self.assertNotIn("apiFetch('/api/auth/session', { csrf: false })", self.source)
+        self.assertIn("new BroadcastChannel(AUTH_CHANNEL)", self.source)
+        self.assertIn("['omicsang.term.v1', `omicsang.csrf.${csrfToken}`]", self.source)
 
     def test_api_file_surfaces_use_authenticated_blob_fetches(self) -> None:
         self.assertIn("async function authenticatedObjectUrl(raw)", self.source)
@@ -298,7 +309,7 @@ class FrontendSecurityContractTests(unittest.TestCase):
         self.assertIn("pipelineIndex", snapshot_source)
         self.assertNotRegex(snapshot_source, r"\bpipeline\s*:")
         self.assertIn(
-            "api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/read`, { path })",
+            "api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/read`, { path }, { invalidate: false })",
             self.source,
         )
         self.assertIn("/browse/search`, {", self.source)

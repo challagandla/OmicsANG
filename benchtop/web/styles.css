@@ -1159,6 +1159,39 @@ a { color: var(--accent); }
 .agent-disclosure-body { padding: 7px 10px 9px; }
 .agent-disclosure-body p { margin: 4px 0; }
 .boot-error { margin: 0; padding: 20px; color: var(--err); white-space: pre-wrap; }
+.connection-banner {
+  flex: 0 0 auto; display: flex; gap: 12px; align-items: center; justify-content: center;
+  padding: 6px 12px; background: #3a1d1d; color: var(--fg); border-bottom: 1px solid var(--err);
+  font-size: var(--control-font-size);
+}
+.notices {
+  position: fixed; right: 16px; bottom: 16px; z-index: 1000; display: flex; flex-direction: column; gap: 8px;
+  width: min(520px, calc(100vw - 32px)); max-height: 70vh; overflow-y: auto;
+}
+.notice {
+  background: var(--bg2); border: 1px solid var(--border); border-left: 3px solid var(--err);
+  border-radius: 6px; padding: 10px 12px; box-shadow: 0 6px 24px rgba(0,0,0,.45);
+}
+.notice.info { border-left-color: var(--accent); }
+.notice-text {
+  margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
+  font-family: var(--sans); font-size: var(--control-font-size); max-height: 40vh; overflow-y: auto;
+}
+.notice-actions { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
+.signin { max-width: 620px; margin: 8vh auto 0; padding: 0 24px; overflow: auto; }
+.signin h1 { margin: 0 0 8px; font-size: 22px; }
+.signin-lead { margin: 0 0 16px; }
+.signin-steps { margin: 0 0 18px; padding-left: 20px; color: var(--muted); line-height: 1.7; }
+.signin-steps code { color: var(--fg); font-family: var(--mono); font-size: var(--small-font-size); }
+.signin-form { display: flex; gap: 8px; }
+.signin-input {
+  flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg2); color: var(--fg); font-family: var(--mono); font-size: var(--control-font-size);
+}
+.signin-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.signin-status { min-height: 1.6em; margin-top: 10px; color: var(--muted); }
+.signin-status.err { color: var(--err); }
+.signin-note { margin-top: 18px; font-size: var(--small-font-size); }
 
 @media (max-width: 1400px) {
   .study-layout, .capsule-layout, .capsule-picker { grid-template-columns: 1fr; }

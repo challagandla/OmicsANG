@@ -252,21 +252,11 @@ Keep this terminal open. Do not add `&`, `nohup`, or a service wrapper for the
 tutorial. OmicsANG remains attached to the terminal, and you will stop it later
 with `Ctrl-C`.
 
-OmicsANG normally opens your browser with a one-time launch URL. Use the newly
-opened tab. The URL fragment is consumed locally and removed from the address
-bar before the main application loads.
-
-If no browser opens, stop OmicsANG with `Ctrl-C` and relaunch from an interactive
-terminal with `--no-browser` added:
-
-```bash
-omicsang \
-  --root "$OMICSANG_TUTORIAL_ROOT" \
-  --state "$OMICSANG_TUTORIAL_STATE" \
-  --host 127.0.0.1 \
-  --port 8787 \
-  --no-browser
-```
+OmicsANG prints a one-time launch URL on the terminal you started it from. Open
+that complete URL in a browser on the same machine (most terminals let you
+Ctrl-click it). OmicsANG does not start a browser itself, so the token never
+appears in another process's command line. The URL fragment is consumed locally
+and removed from the address bar before the main application loads.
 
 Copy the newest complete one-time URL from that terminal into a browser on the
 same machine. Do not share, record, or screenshot the URL. Opening only
@@ -426,7 +416,7 @@ omicsang \
   --port 8787
 ```
 
-Use the newly opened browser tab. A restart invalidates the old browser session
+Use the browser tab you opened from the launch URL. A restart invalidates the old browser session
 and creates a new one-time launch URL.
 
 ## 14. Bring your own pipeline
@@ -471,7 +461,7 @@ resources, and interpretation.
 | Browser says unauthorized | Close old tabs, relaunch OmicsANG, and use the newest browser tab or newest complete one-time URL. |
 | Port 8787 is in use | Stop the exact older OmicsANG process, or temporarily use `--port 8788`. Avoid broad process-kill commands. |
 | State belongs to another root | Reuse the original root, or choose a different external `--state` directory. Never merge state databases. |
-| `--no-browser` refuses to start | It requires an interactive controlling terminal by design; do not run it through `nohup`, redirected output, or a background service. |
+| OmicsANG refuses to start | It requires an interactive controlling terminal by design; do not run it through `nohup`, redirected output, or a background service. |
 | A panel disappeared | Use the floating **Hidden panels** dock to restore Pipelines, Monitor, Files, Assistant, or Terminal without leaving the current tab. |
 | DAG rendering fails | Install Graphviz and check `dot -V`. Some job DAGs also need their configured inputs. |
 | Native Windows or macOS launch fails | Use Linux; on Windows, run inside WSL. Native macOS is not supported in this release. |

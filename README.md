@@ -109,10 +109,10 @@ integration.
 ## Recommended installation with pip and venv
 
 Download and extract an OmicsANG release source archive, then enter its top-level
-directory. For the `0.2.3` source archive, the complete installation is:
+directory. For the `0.2.4` source archive, the complete installation is:
 
 ```bash
-cd omicsang-0.2.3
+cd omicsang-0.2.4
 python3 -m venv "$HOME/.venvs/omicsang"
 . "$HOME/.venvs/omicsang/bin/activate"
 python -m pip install --upgrade pip
@@ -122,11 +122,11 @@ omicsang --version
 
 The installed CLI and web assets no longer depend on that source directory.
 Keep the virtual environment activated when using the commands in the tutorial.
-If you downloaded the `0.2.3` wheel into the current directory, it can be
+If you downloaded the `0.2.4` wheel into the current directory, it can be
 installed in the same environment instead:
 
 ```bash
-python -m pip install ./omicsang-0.2.3-py3-none-any.whl
+python -m pip install ./omicsang-0.2.4-py3-none-any.whl
 ```
 
 Use a fresh virtual environment for the rename. Do not install OmicsANG into an
@@ -216,25 +216,19 @@ the pipeline root:
 omicsang --root "$HOME/omicsang-workspace" --state "$HOME/.local/state/omicsang-demo" --host 127.0.0.1 --port 8787
 ```
 
-OmicsANG normally sends a URL containing a one-time token in the URL fragment
-directly to the registered Linux desktop browser through `/usr/bin/xdg-open` or
-`/usr/bin/gio`. It does not honor the `BROWSER` environment variable, construct
-a shell command, or connect the opener to OmicsANG's stdin, stdout, or stderr.
-The token is therefore omitted from ordinary process and service logs. The
-fragment is
-captured and removed from the address bar by the first local page script, before
-the vendored terminal libraries or main application execute. It is then
-exchanged locally and replaced by a process-scoped browser session. A restart
-creates a new URL and invalidates the old session. To prevent automatic browser
-launch, add `--no-browser`; the complete one-time URL is then written directly
+OmicsANG writes a URL containing a one-time token in the URL fragment directly
 to the controlling terminal (`/dev/tty`), bypassing redirected stdout and
-stderr:
+stderr. Open that complete URL in a browser on the same machine. OmicsANG never
+starts a browser itself: a URL passed to a desktop opener would appear in that
+process's command line, which every local account can read through `/proc`, and
+the token could be redeemed there first. The fragment is captured and removed
+from the address bar by the first local page script, before the vendored
+terminal libraries or main application execute. It is then exchanged locally
+for a process-scoped browser session. A restart creates a new URL and
+invalidates the old session. `--no-browser` is still accepted for compatibility
+and has no further effect.
 
-```bash
-omicsang --root "$HOME/omicsang-workspace" --state "$HOME/.local/state/omicsang-demo" --host 127.0.0.1 --port 8787 --no-browser
-```
-
-`--no-browser` intentionally refuses to start when there is no controlling
+OmicsANG intentionally refuses to start when there is no controlling
 terminal. Run it in an interactive terminal and use the complete URL shown
 there; this prevents a process supervisor or redirected output file from
 persisting the launch capability. A terminal recorder or OS-level process
@@ -489,8 +483,7 @@ remove OmicsANG-managed state.
 ## Troubleshooting
 
 - **The browser reports unauthorized:** close old OmicsANG tabs and relaunch.
-  With normal launch, use the newly opened tab; with `--no-browser`, use the
-  newest complete URL shown directly on the controlling terminal.
+  Use the newest complete URL shown directly on the controlling terminal.
 - **The port is already in use:** stop the other local process or choose another
   loopback port, such as `--port 8788`.
 - **The state belongs to a different pipeline root:** OmicsANG deliberately binds

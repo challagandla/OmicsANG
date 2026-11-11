@@ -8,14 +8,18 @@ const displayCache = window.OmicsPerformance.createDisplayCache();
 let displayRevision = 0;
 function invalidateDisplayData() {
   displayCache.clear();
+  clearImageCache();
   displayRevision += 1;
-  state.pipelineHealth = {};
+  state.pipelineHealth = nameMap();
 }
 function displayRead(url, force = false) {
   return displayCache.read(url, () => api.get(url), force);
 }
 
 let csrfToken = '';
+// Generous enough for DAG rendering and git network operations, which the
+// server itself bounds at two minutes.
+const REQUEST_TIMEOUT_MS = { read: 150000, change: 300000 };
 
 async function responseError(response) {
   const body = await response.text();
@@ -47,7 +51,30 @@ async function apiFetch(url, options = {}) {
   }
   const init = { ...options, method, headers, credentials: 'same-origin' };
   delete init.csrf;
-  return fetch(target.href, init);
+  delete init.timeout;
+  // No request may wait forever for the server to begin answering.  The limit
+  // covers the wait for response headers only, so a large download that has
+  // started is never cut off; a caller's own signal still cancels everything.
+  const limit = Number.isFinite(options.timeout) ? options.timeout
+    : method === 'GET' ? REQUEST_TIMEOUT_MS.read : REQUEST_TIMEOUT_MS.change;
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, limit);
+  if (options.signal) {
+    if (options.signal.aborted) controller.abort(options.signal.reason);
+    else options.signal.addEventListener('abort', () => controller.abort(options.signal.reason), { once: true });
+  }
+  init.signal = controller.signal;
+  try {
+    return await fetch(target.href, init);
+  } catch (error) {
+    if (!timedOut) throw error;
+    const failure = new Error(`The OmicsANG server did not answer within ${Math.round(limit / 1000)} seconds. It may be busy or stopped; nothing was confirmed.`);
+    failure.code = 'timeout';
+    throw failure;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function jsonResponse(response) {
@@ -57,15 +84,18 @@ async function jsonResponse(response) {
 
 const api = {
   response(url, options = {}) { return apiFetch(url, options); },
-  async get(url) { return jsonResponse(await apiFetch(url)); },
+  async get(url, options = {}) { return jsonResponse(await apiFetch(url, options)); },
+  // Pass { invalidate: false } only for POSTs that read without changing
+  // server state; every other POST drops cached presentation data.
   async post(url, body, options = {}) {
+    const { invalidate = true, ...fetchOptions } = options;
     const result = await jsonResponse(await apiFetch(url, {
-      ...options,
+      ...fetchOptions,
       method: 'POST',
-      headers: { ...(options.headers || {}), 'Content-Type': 'application/json' },
+      headers: { ...(fetchOptions.headers || {}), 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {}),
     }));
-    invalidateDisplayData();
+    if (invalidate) invalidateDisplayData();
     return result;
   },
   async text(url) {
@@ -180,14 +210,18 @@ function fontStack(list, key) {
   return (list.find(f => f[0] === key) || list[0])[2];
 }
 
+// Pipeline names are local directory names, so maps keyed by them must not
+// inherit from Object.prototype (a directory may be called `__proto__`).
+const nameMap = () => Object.create(null);
+
 const state = {
   meta: null, pipelines: [], selected: null, detail: null,
-  tab: 'overview', sessions: [], focusedSession: null, runForm: {},
-  runQueue: null, runTemplates: {}, slurm: null, slurmForm: {}, health: null,
-  dagForm: {}, dagResult: {}, view: 'pipeline', fleetActive: null, fleetForm: null,
-  code: {}, commandOpen: false, commandQuery: '',
-  fleetMode: 'health', pipelineHealth: {}, resultsFilter: {}, github: {},
-  sraGeo: {}, study: {}, capsules: {}, browse: {}, viewSettingsOpen: false, uiPrefs: loadUiPrefs(),
+  tab: 'overview', sessions: [], focusedSession: null, runForm: nameMap(),
+  runQueue: null, runTemplates: nameMap(), slurm: null, slurmForm: nameMap(), health: null,
+  dagForm: nameMap(), dagResult: nameMap(), view: 'pipeline', fleetActive: null, fleetForm: null,
+  code: nameMap(), commandOpen: false, commandQuery: '',
+  fleetMode: 'health', pipelineHealth: nameMap(), resultsFilter: nameMap(), github: nameMap(),
+  sraGeo: nameMap(), study: nameMap(), capsules: nameMap(), browse: nameMap(), viewSettingsOpen: false, uiPrefs: loadUiPrefs(),
   pipelineQuery: '', recentNavigation: [],
   navigation: { index: 0, maxIndex: 0, restoring: false, restoreToken: 0 },
   help: { open: false, data: null, loading: false, attempted: false, error: '', returnFocus: null },
@@ -217,6 +251,51 @@ function el(tag, attrs = {}, ...kids) {
   }
   return e;
 }
+// Problems and results are reported in the page rather than through a blocking
+// browser dialog: the text stays visible beside the log it refers to, can be
+// selected or copied, and remains until dismissed.
+const NOTICE_LIMIT = 6;
+function notify(message, kind = 'error') {
+  const text = String(message == null ? '' : message);
+  let stack = document.getElementById('notices');
+  if (!stack) {
+    stack = el('div', { id: 'notices', class: 'notices', role: 'region', 'aria-label': 'Notifications' });
+    document.body.append(stack);
+  }
+  const last = stack.lastElementChild;
+  if (last && last.dataset.text === text) {
+    const count = Number(last.dataset.count || 1) + 1;
+    last.dataset.count = String(count);
+    last.querySelector('.notice-count').textContent = `×${count}`;
+    return last;
+  }
+  const body = el('pre', { class: 'notice-text' }, text);
+  const copy = el('button', { type: 'button', class: 'ghost sm' }, 'Copy');
+  copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(text); copy.textContent = 'Copied'; }
+    catch (e) {
+      // Clipboard access can be refused; selecting the text still lets it be copied.
+      const range = document.createRange();
+      range.selectNodeContents(body);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+  };
+  const notice = el('div', {
+    class: `notice ${kind === 'info' ? 'info' : 'error'}`,
+    role: kind === 'info' ? 'status' : 'alert',
+  }, body, el('div', { class: 'notice-actions' },
+    el('span', { class: 'notice-count muted' }),
+    copy,
+    el('button', { type: 'button', class: 'ghost sm', 'aria-label': 'Dismiss notification',
+      onclick: () => notice.remove() }, 'Dismiss')));
+  notice.dataset.text = text;
+  stack.append(notice);
+  while (stack.children.length > NOTICE_LIMIT) stack.firstElementChild.remove();
+  return notice;
+}
+
 const fmtBytes = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n/1024).toFixed(1)} KB` : `${(n/1048576).toFixed(1)} MB`;
 const fmtTime = (t) => t ? new Date(t * 1000).toLocaleString() : '—';
 const shortPath = (p, n = 3) => (p || '').split('/').filter(Boolean).slice(-n).join('/') || p || '—';
@@ -286,20 +365,87 @@ async function authenticatedObjectUrl(raw) {
   };
 }
 
-async function loadAuthenticatedImage(image, raw) {
-  try {
-    const resource = await authenticatedObjectUrl(raw);
-    if (!image.isConnected) {
-      resource.revoke();
-      return;
-    }
-    image.addEventListener('load', resource.revoke, { once: true });
-    image.addEventListener('error', resource.revoke, { once: true });
-    image.src = resource.url;
-  } catch (e) {
-    image.alt = `Could not load image: ${e.message}`;
-    image.title = e.message;
+// Figures are fetched once per view of the data and shared between the "key
+// figures" strip, the gallery, and the lightbox, instead of downloading the
+// same full-size file for each of them and again on every redraw.
+const IMAGE_CACHE_LIMIT = 120;
+const imageCache = new Map();
+
+function retireImageEntry(entry) {
+  // An <img> that already decoded keeps its pixels after revocation; the delay
+  // lets one that is still loading finish.
+  entry.promise.then(url => setTimeout(() => URL.revokeObjectURL(url), 60000)).catch(() => {});
+}
+
+function clearImageCache() {
+  for (const entry of imageCache.values()) retireImageEntry(entry);
+  imageCache.clear();
+}
+
+function cachedImageUrl(raw) {
+  const target = sameOriginUrl(raw);
+  if (!target) return Promise.reject(new Error('Invalid same-origin file URL'));
+  let entry = imageCache.get(target);
+  if (entry) {
+    imageCache.delete(target);  // refresh its position: most recently used last
+  } else {
+    entry = {
+      promise: (async () => {
+        const response = await apiFetch(target);
+        if (!response.ok) throw await responseError(response);
+        return URL.createObjectURL(await response.blob());
+      })(),
+    };
+    entry.promise.catch(() => { if (imageCache.get(target) === entry) imageCache.delete(target); });
   }
+  imageCache.set(target, entry);
+  while (imageCache.size > IMAGE_CACHE_LIMIT) {
+    const oldest = imageCache.keys().next().value;
+    retireImageEntry(imageCache.get(oldest));
+    imageCache.delete(oldest);
+  }
+  return entry.promise;
+}
+
+// `loading="lazy"` cannot defer an authenticated fetch, so visibility is
+// observed here: a 60-figure page only downloads what is on or near the screen.
+const pendingImages = new Map();
+const imageObserver = typeof IntersectionObserver === 'function'
+  ? new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const pending = pendingImages.get(entry.target);
+      if (pending) pending.start();
+    }
+  }, { rootMargin: '300px' })
+  : null;
+
+function forgetDetachedImages() {
+  const cutoff = Date.now() - 30000;
+  for (const [image, pending] of pendingImages) {
+    if (!image.isConnected && pending.at < cutoff) {
+      imageObserver.unobserve(image);
+      pendingImages.delete(image);
+    }
+  }
+}
+
+function loadAuthenticatedImage(image, raw) {
+  const start = async () => {
+    if (imageObserver) imageObserver.unobserve(image);
+    pendingImages.delete(image);
+    try {
+      const url = await cachedImageUrl(raw);
+      if (image.isConnected) image.src = url;
+    } catch (e) {
+      image.alt = `Could not load image: ${e.message}`;
+      image.title = e.message;
+    }
+  };
+  if (!imageObserver) { start(); return; }
+  forgetDetachedImages();
+  pendingImages.set(image, { start, at: Date.now() });
+  imageObserver.observe(image);
 }
 
 async function openAuthenticatedFile(raw, filename = '') {
@@ -325,7 +471,7 @@ async function openAuthenticatedFile(raw, filename = '') {
     return true;
   } catch (e) {
     if (pending) pending.close();
-    window.alert(`Could not open file:\n${e.message}`);
+    notify(`Could not open file:\n${e.message}`);
     return false;
   }
 }
@@ -364,7 +510,7 @@ async function openAuthenticatedPostFile(raw, body, filename = '') {
     return true;
   } catch (e) {
     if (pending) pending.close();
-    window.alert(`Could not open file:\n${e.message}`);
+    notify(`Could not open file:\n${e.message}`);
     return false;
   }
 }
@@ -619,7 +765,8 @@ function setUiPref(key, value, opts = {}) {
   state.uiPrefs[key] = value;
   state.uiPrefs = sanitizeUiPrefs(state.uiPrefs);
   applyUiPrefs();
-  saveUiPrefs();
+  // A drag reports many intermediate values; only the final one is stored.
+  if (opts.persist !== false) saveUiPrefs();
   if (key === 'monitorOpen') renderMonitor();
   if (opts.renderSettings !== false) renderViewSettings();
 }
@@ -630,20 +777,35 @@ function startPreferenceResize(e, key, min, max, axis = 'x', invert = false) {
   const startPos = axis === 'y' ? e.clientY : e.clientX;
   document.body.classList.add('resizing');
   document.body.classList.toggle('resizing-y', axis === 'y');
+  // Pointer events arrive faster than the screen repaints; apply only the
+  // newest position once per frame.
+  let pending = null;
+  let frame = 0;
+  const apply = () => {
+    frame = 0;
+    if (pending === null || pending === state.uiPrefs[key]) return;
+    setUiPref(key, pending, { renderSettings: false, persist: false });
+  };
   const move = (ev) => {
     const pos = axis === 'y' ? ev.clientY : ev.clientX;
     const delta = (pos - startPos) * (invert ? -1 : 1);
-    setUiPref(key, clampNum(Math.round(start + delta), min, max), { renderSettings: false });
+    pending = clampNum(Math.round(start + delta), min, max);
+    if (!frame) frame = requestAnimationFrame(apply);
   };
   const up = () => {
+    if (frame) cancelAnimationFrame(frame);
+    apply();
     document.body.classList.remove('resizing');
     document.body.classList.remove('resizing-y');
     window.removeEventListener('pointermove', move);
     window.removeEventListener('pointerup', up);
+    window.removeEventListener('pointercancel', up);
+    saveUiPrefs();
     renderViewSettings();
   };
   window.addEventListener('pointermove', move);
-  window.addEventListener('pointerup', up, { once: true });
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
 }
 
 function initResizeHandles() {
@@ -698,7 +860,7 @@ function syncPanelRestoreDock(preferences = state.uiPrefs) {
 
 function focusRestoredPanel(key) {
   if (key === 'terminalOpen' && state.focusedSession) {
-    fitTerminal(state.focusedSession);
+    fitTerminal(state.focusedSession, { focus: true });
     return;
   }
   const target = {
@@ -885,13 +1047,144 @@ function bootstrapTokenFromFragment() {
   return '';
 }
 
+// The session cookie is sent to every port on this host, so it is never
+// sufficient on its own.  The page secret returned by the one-time launch
+// exchange is kept in sessionStorage, which is scoped to this exact origin
+// (including the port) and to this tab; other tabs of the same origin can ask
+// for it over a BroadcastChannel, which is same-origin by construction.
+const PAGE_SECRET_KEY = 'omicsang.page-secret';
+const AUTH_CHANNEL = 'omicsang.auth.v1';
+let authChannel = null;
+
+function storedPageSecret() {
+  try { return window.sessionStorage.getItem(PAGE_SECRET_KEY) || ''; }
+  catch (e) { return ''; }
+}
+
+function rememberPageSecret(value) {
+  try {
+    if (value) window.sessionStorage.setItem(PAGE_SECRET_KEY, value);
+    else window.sessionStorage.removeItem(PAGE_SECRET_KEY);
+  } catch (e) {}
+}
+
+function pageSecretFromOtherTab(timeoutMs = 600) {
+  if (typeof BroadcastChannel !== 'function') return Promise.resolve('');
+  return new Promise((resolve) => {
+    const channel = new BroadcastChannel(AUTH_CHANNEL);
+    const finish = (value) => { channel.close(); resolve(value); };
+    const timer = setTimeout(() => finish(''), timeoutMs);
+    channel.onmessage = (event) => {
+      const data = event.data;
+      if (data && data.type === 'page-secret' && typeof data.secret === 'string' && data.secret) {
+        clearTimeout(timer);
+        finish(data.secret);
+      }
+    };
+    channel.postMessage({ type: 'page-secret-request' });
+  });
+}
+
+function sharePageSecretWithOtherTabs() {
+  if (authChannel || typeof BroadcastChannel !== 'function') return;
+  authChannel = new BroadcastChannel(AUTH_CHANNEL);
+  authChannel.onmessage = (event) => {
+    if (event.data && event.data.type === 'page-secret-request' && csrfToken)
+      authChannel.postMessage({ type: 'page-secret', secret: csrfToken });
+  };
+}
+
+async function pageSecretIsLive(candidate) {
+  if (!candidate) return false;
+  csrfToken = candidate;
+  try {
+    const response = await apiFetch('/api/auth/session');
+    if (response.ok) return true;
+  } catch (e) {}
+  csrfToken = '';
+  return false;
+}
+
 async function bootstrapAuthentication() {
   const token = bootstrapTokenFromFragment();
-  const result = token
-    ? await api.post('/api/auth/bootstrap', { token }, { csrf: false })
-    : await jsonResponse(await apiFetch('/api/auth/session', { csrf: false }));
-  csrfToken = typeof result.csrf === 'string' ? result.csrf : '';
-  if (!csrfToken) throw new Error('Authentication did not return a CSRF token.');
+  if (token) {
+    const result = await api.post('/api/auth/bootstrap', { token }, { csrf: false });
+    csrfToken = typeof result.csrf === 'string' ? result.csrf : '';
+    if (!csrfToken) throw new Error('Authentication did not return a page secret.');
+  } else if (!(await pageSecretIsLive(storedPageSecret()))
+    && !(await pageSecretIsLive(await pageSecretFromOtherTab()))) {
+    rememberPageSecret('');
+    const error = new Error('This tab is not signed in.');
+    error.code = 'unauthenticated';
+    throw error;
+  }
+  rememberPageSecret(csrfToken);
+  sharePageSecretWithOtherTabs();
+}
+
+// Accepts either the whole launch URL or just the code after "#bootstrap=".
+function launchCodeFromInput(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  const fragment = text.includes('#') ? text.slice(text.indexOf('#') + 1) : text;
+  if (fragment.includes('=')) {
+    const params = new URLSearchParams(fragment);
+    return params.get('bootstrap') || params.get('token') || '';
+  }
+  return fragment;
+}
+
+async function redeemLaunchCode(raw) {
+  const token = launchCodeFromInput(raw);
+  if (!token) throw new Error('Paste the launch URL or code shown on the OmicsANG terminal.');
+  const result = await api.post('/api/auth/bootstrap', { token }, { csrf: false });
+  if (typeof result.csrf !== 'string' || !result.csrf)
+    throw new Error('The server did not complete sign-in.');
+  rememberPageSecret(result.csrf);
+}
+
+// Shown instead of the workspace when this tab holds no valid page secret:
+// after closing every tab, opening the bare address, or restarting the server.
+function renderSignIn() {
+  const status = el('div', { class: 'signin-status', role: 'status', 'aria-live': 'polite' });
+  const input = el('input', {
+    type: 'password', class: 'signin-input', autocomplete: 'off', spellcheck: 'false',
+    'aria-label': 'Launch URL or code', placeholder: 'Paste the launch URL or code',
+  });
+  const submit = el('button', { type: 'submit', class: 'primary' }, 'Sign in');
+  const form = el('form', { class: 'signin-form' }, input, submit);
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    status.className = 'signin-status';
+    status.textContent = 'Signing in…';
+    try {
+      await redeemLaunchCode(input.value);
+      window.location.reload();
+    } catch (e) {
+      input.value = '';
+      submit.disabled = false;
+      status.className = 'signin-status err';
+      status.textContent = e.status === 401
+        ? 'That code was already used or has expired. Each code works once; run `omicsang open` for a new one.'
+        : e.message;
+      input.focus();
+    }
+  };
+  document.body.replaceChildren(el('main', { class: 'signin' },
+    el('h1', {}, 'OmicsANG'),
+    el('p', { class: 'signin-lead' }, 'This browser tab is not signed in to the OmicsANG running on this machine.'),
+    el('ol', { class: 'signin-steps' },
+      el('li', {}, 'In the terminal where OmicsANG started, find the line ',
+        el('code', {}, 'one-time launch URL'), '.'),
+      el('li', {}, 'If it was already used or has scrolled away, run ',
+        el('code', {}, 'omicsang open'), ' in another terminal (add the same ',
+        el('code', {}, '--state'), ' if you started OmicsANG with one) to print a fresh one.'),
+      el('li', {}, 'Paste the whole URL, or only the code after ', el('code', {}, '#bootstrap='), ', below.')),
+    form, status,
+    el('p', { class: 'muted signin-note' },
+      'Each code works once and is never sent anywhere but this local server. Other open OmicsANG tabs stay signed in.')));
+  input.focus();
 }
 
 async function boot() {
@@ -1110,7 +1403,7 @@ async function applyNavigationSnapshot(snapshot, restoring = false) {
     renderSidebar();
     render();
   } catch (e) {
-    if (!restoring) window.alert(`Could not restore that workspace view:\n${e.message}`);
+    if (!restoring) notify(`Could not restore that workspace view:\n${e.message}`);
   } finally {
     if (token === state.navigation.restoreToken) state.navigation.restoring = false;
   }
@@ -1657,28 +1950,39 @@ function closeCommandPalette() {
   if (commandPalette) commandPalette.classList.add('hidden');
 }
 
-function renderCommandPalette() {
-  if (!commandPalette) return;
-  if (!state.commandOpen) { commandPalette.classList.add('hidden'); return; }
-  commandPalette.classList.remove('hidden');
+function commandMatches() {
   const q = state.commandQuery.trim().toLowerCase();
-  let items = commandItems().map((item) => {
+  return commandItems().map((item) => {
     const text = `${item.title} ${item.detail}`.toLowerCase();
     const score = q ? fuzzyScore(text, q) : 0;
     return { ...item, score: score + item.weight };
   }).filter(item => !q || item.score > -Infinity)
     .sort((a, b) => b.score - a.score)
     .slice(0, 12);
+}
+
+function renderCommandPalette() {
+  if (!commandPalette) return;
+  if (!state.commandOpen) { commandPalette.classList.add('hidden'); return; }
+  commandPalette.classList.remove('hidden');
+  let items = [];
+  const list = el('div', { class: 'cmdk-list' });
+  // Only the result list changes while typing.  Replacing the input itself on
+  // every keystroke reset the caret and broke composed (IME) text entry.
+  const drawList = () => {
+    items = commandMatches();
+    list.replaceChildren();
+    if (!items.length) list.append(el('div', { class: 'cmdk-empty' }, 'No matching command'));
+    items.forEach((item) => list.append(el('button', { class: 'cmdk-item', onclick: () => { closeCommandPalette(); item.run(); } },
+      el('span', {}, item.title), el('small', {}, item.detail || ''))));
+  };
   const input = el('input', { type: 'text', value: state.commandQuery, placeholder: 'Jump to pipeline, view, run, result, or terminal' });
-  input.oninput = () => { state.commandQuery = input.value; renderCommandPalette(); };
+  input.oninput = () => { state.commandQuery = input.value; drawList(); };
   input.onkeydown = (e) => {
     if (e.key === 'Escape') { closeCommandPalette(); return; }
-    if (e.key === 'Enter' && items[0]) { closeCommandPalette(); items[0].run(); }
+    if (e.key === 'Enter' && !e.isComposing && items[0]) { closeCommandPalette(); items[0].run(); }
   };
-  const list = el('div', { class: 'cmdk-list' });
-  if (!items.length) list.append(el('div', { class: 'cmdk-empty' }, 'No matching command'));
-  items.forEach((item) => list.append(el('button', { class: 'cmdk-item', onclick: () => { closeCommandPalette(); item.run(); } },
-    el('span', {}, item.title), el('small', {}, item.detail || ''))));
+  drawList();
   commandPalette.innerHTML = '';
   commandPalette.append(el('div', { class: 'cmdk-backdrop', onclick: closeCommandPalette }),
     el('div', { class: 'cmdk-box' }, input, list));
@@ -1838,14 +2142,14 @@ async function loadStudyReport(d, options = {}) {
   try {
     let report;
     if (options.roles !== undefined) {
-      report = await api.post(`/api/pipelines/${d.name}/study`, {
+      report = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/study`, {
         configfile,
         sheet: options.sheet || '',
         roles: options.roles,
       });
     } else {
       const query = new URLSearchParams({ configfile, sheet: options.sheet || '' });
-      report = await api.get(`/api/pipelines/${d.name}/study?${query}`);
+      report = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}/study?${query}`);
     }
     if (request !== s.request) return s.report;
     s.report = report;
@@ -1892,7 +2196,7 @@ function reconcilePlannedStudy(d, f, planned, realRun) {
   if (realRun && report.selected && !report.selected.authoritative) {
     state.tab = 'study';
     render();
-    window.alert('The discovered study is not referenced by this Run config. Update Config and re-audit before a real run.');
+    notify('The discovered study is not referenced by this Run config. Update Config and re-audit before a real run.');
     return false;
   }
   const s = studyState(d);
@@ -1912,7 +2216,7 @@ function reconcilePlannedStudy(d, f, planned, realRun) {
   f.plan_digest = '';
   if (!matches) {
     render();
-    window.alert('Study Guard changed since the displayed audit. Review the refreshed findings, then launch again.');
+    notify('Study Guard changed since the displayed audit. Review the refreshed findings, then launch again.');
     return false;
   }
   return true;
@@ -2019,7 +2323,7 @@ async function openPipelineCodeFile(d, path) {
     return;
   }
   try {
-    const r = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/read`, { path });
+    const r = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/read`, { path }, { invalidate: false });
     let tab = c.tabs.find(item => item.path === r.path || item.loadedPath === r.path);
     if (!tab) {
       tab = { key: r.path };
@@ -2036,7 +2340,7 @@ async function openPipelineCodeFile(d, path) {
     state.tab = 'code';
     render();
   } catch (e) {
-    window.alert('Could not open study source:\n' + e.message);
+    notify('Could not open study source:\n' + e.message);
   }
 }
 
@@ -2122,7 +2426,7 @@ async function viewStudy(view) {
             confirmed.selected.path !== report.selected.path ||
             confirmed.fingerprint !== report.fingerprint) {
           draw(confirmed);
-          window.alert('The configured study changed. Review the fresh audit, then click Use audited study again.');
+          notify('The configured study changed. Review the fresh audit, then click Use audited study again.');
           return;
         }
         f.study_sheet = confirmed.selected.path;
@@ -2240,7 +2544,7 @@ function runQueuePanel() {
         e.currentTarget.disabled = true;
         e.currentTarget.textContent = 'Canceling…';
         try { await api.post(`/api/jobs/${durableId}/cancel`, {}); await refreshRunQueue(true); }
-        catch (err) { window.alert('Cancel failed: ' + err.message); await refreshRunQueue(true); }
+        catch (err) { notify('Cancel failed: ' + err.message); await refreshRunQueue(true); }
       } }, 'Cancel') : deadLost ? el('button', { class: 'ghost sm danger-outline', onclick: async (e) => {
         e.stopPropagation();
         const reason = window.prompt('Acknowledge this orphaned job as failed. Enter an audit reason:');
@@ -2252,7 +2556,7 @@ function runQueuePanel() {
           });
           await refreshRunQueue(true);
         } catch (err) {
-          window.alert('Resolve failed: ' + err.message);
+          notify('Resolve failed: ' + err.message);
           await refreshRunQueue(true);
         }
       } }, 'Resolve failed') : null));
@@ -2270,7 +2574,7 @@ function runQueuePanel() {
 
 async function loadRunTemplates(name, shouldRender = false) {
   try {
-    const res = await api.get(`/api/pipelines/${name}/run_templates`);
+    const res = await api.get(`/api/pipelines/${encodeURIComponent(name)}/run_templates`);
     state.runTemplates[name] = res.templates || [];
     if (shouldRender) render();
   } catch (e) {
@@ -2279,10 +2583,18 @@ async function loadRunTemplates(name, shouldRender = false) {
 }
 
 function runTemplatePanel(d, f) {
+  // The full pipeline detail already carries the saved profiles.
+  if (!state.runTemplates[d.name] && Array.isArray(d.run_templates))
+    state.runTemplates[d.name] = d.run_templates;
   const templates = state.runTemplates[d.name];
   if (!templates) {
-    loadRunTemplates(d.name, true);
-    return el('div', { class: 'card' }, el('div', { class: 'muted' }, 'Loading saved run profiles...'));
+    // Fill this card in place.  Re-rendering the whole view here rebuilt the
+    // run form under the user's cursor and discarded what they were typing.
+    const placeholder = el('div', { class: 'card' }, el('div', { class: 'muted' }, 'Loading saved run profiles...'));
+    loadRunTemplates(d.name).then(() => {
+      if (placeholder.isConnected) placeholder.replaceWith(runTemplatePanel(d, f));
+    });
+    return placeholder;
   }
   const sel = el('select', { style: 'max-width:280px' },
     el('option', { value: '' }, templates.length ? 'Select saved profile' : 'No saved profiles'),
@@ -2305,7 +2617,7 @@ function runTemplatePanel(d, f) {
       const id = sel.value || '';
       const form = { ...f };
       delete form.plan_digest;
-      await api.post(`/api/pipelines/${d.name}/run_templates`, { id, name, form });
+      await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/run_templates`, { id, name, form });
       await loadRunTemplates(d.name, true);
     } catch (e) {
       status.textContent = 'error: ' + e.message;
@@ -2317,7 +2629,7 @@ function runTemplatePanel(d, f) {
     if (!window.confirm(`Delete run profile "${t ? t.name : sel.value}"?`)) return;
     status.textContent = 'deleting profile...';
     try {
-      await api.post(`/api/pipelines/${d.name}/run_templates/${sel.value}/delete`, {});
+      await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/run_templates/${sel.value}/delete`, {});
       await loadRunTemplates(d.name, true);
     } catch (e) {
       status.textContent = 'error: ' + e.message;
@@ -2365,8 +2677,17 @@ function slurmFormFor(d) {
   });
 }
 
+let slurmStatusInFlight = null;
+function loadSlurmStatusOnce() {
+  if (!slurmStatusInFlight)
+    slurmStatusInFlight = refreshSlurm(false).finally(() => { slurmStatusInFlight = null; });
+  return slurmStatusInFlight;
+}
+
 function slurmSubmitPanel(d, f) {
-  if (!state.slurm) refreshSlurm(true);
+  // One status request however often the view is rebuilt while it is pending,
+  // and only this card is replaced when it arrives.
+  const pendingStatus = state.slurm ? null : loadSlurmStatusOnce();
   const slurm = state.slurm || { available: false, tools: {}, partitions: [], jobs: [] };
   const capabilities = slurmCapabilities(slurm);
   const sf = slurmFormFor(d);
@@ -2410,7 +2731,7 @@ function slurmSubmitPanel(d, f) {
         study_override: false,
         plan_digest: '',
       };
-      let planned = await api.post(`/api/pipelines/${d.name}/slurm_preview`, body);
+      let planned = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/slurm_preview`, body);
       if (!reconcilePlannedStudy(d, f, planned, !body.dryrun)) return;
       const blocking = planned.study && planned.study.summary ? Number(planned.study.summary.errors || 0) : 0;
       if (!body.dryrun && blocking) {
@@ -2418,13 +2739,13 @@ function slurmSubmitPanel(d, f) {
         if (!proceed) return;
         body.study_override = true;
         body.study_fingerprint = planned.study_fingerprint || '';
-        planned = await api.post(`/api/pipelines/${d.name}/slurm_preview`, body);
+        planned = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/slurm_preview`, body);
         if (!reconcilePlannedStudy(d, f, planned, true)) return;
       }
       body.plan_digest = planned.plan_digest || '';
       if (!body.dryrun && !runPlanResolution(planned).launch_safe) {
         status.textContent = 'real submission blocked: RunPlan resolution is incomplete';
-        window.alert(`Real Slurm execution is blocked by unresolved RunPlan material:\n\n${explainUnsafeRunPlan(planned)}`);
+        notify(`Real Slurm execution is blocked by unresolved RunPlan material:\n\n${explainUnsafeRunPlan(planned)}`);
         return;
       }
       const confirmed = window.confirm(
@@ -2442,7 +2763,7 @@ function slurmSubmitPanel(d, f) {
         return;
       }
       status.textContent = 'submitting locked RunPlan to Slurm...';
-      const res = await api.post(`/api/pipelines/${d.name}/slurm_submit`, body);
+      const res = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/slurm_submit`, body);
       if (!submissionIntentMustPersist(res)) clearSubmissionIntent(intent.slot);
       const jobLabel = res.job.job_id || res.job.id || 'intent pending reconciliation';
       status.textContent = submissionIntentMustPersist(res)
@@ -2455,7 +2776,7 @@ function slurmSubmitPanel(d, f) {
       submitting = false;
     }
   };
-  return el('div', { class: 'card slurm-submit' },
+  const card = el('div', { class: 'card slurm-submit' },
     el('h3', {}, 'Slurm submission'),
     el('div', { class: 'grid3' },
       el('div', {}, el('label', {}, 'Job name'), jobIn),
@@ -2470,6 +2791,10 @@ function slurmSubmitPanel(d, f) {
       el('button', { class: 'ghost', onclick: submit, disabled: capabilities.submit ? null : '' }, 'Submit via sbatch'),
       el('button', { class: 'ghost sm', onclick: () => refreshSlurm(true) }, 'Refresh Slurm'),
       status));
+  if (pendingStatus) pendingStatus.then(() => {
+    if (card.isConnected) card.replaceWith(slurmSubmitPanel(d, f));
+  });
+  return card;
 }
 
 function viewRun(view) {
@@ -2598,7 +2923,7 @@ function updatePreview(name, f, target) {
   previewTimer = setTimeout(async () => {
     const body = { ...f, plan_digest: '' };
     try {
-      const res = await api.post(`/api/pipelines/${name}/preview`, body);
+      const res = await api.post(`/api/pipelines/${encodeURIComponent(name)}/preview`, body);
       if (previewRequests.get(name) !== request || !target.isConnected) return;
       const d = state.detail && state.detail.name === name ? state.detail : null;
       const s = state.study[name];
@@ -2623,7 +2948,7 @@ function updatePreview(name, f, target) {
 }
 
 async function launchRun(name, f, dryrun) {
-  state.launching = state.launching || {};
+  state.launching = state.launching || nameMap();
   if (state.launching[name]) return;
   state.launching[name] = true;
   let intent = null;
@@ -2648,7 +2973,7 @@ async function launchRun(name, f, dryrun) {
       study_fingerprint: cached ? (cached.fingerprint || '') : '',
       plan_digest: '',
     };
-    let planned = await api.post(`/api/pipelines/${name}/preview`, body);
+    let planned = await api.post(`/api/pipelines/${encodeURIComponent(name)}/preview`, body);
     if (!reconcilePlannedStudy(d, f, planned, !dryrun)) return;
     const blocking = planned.study && planned.study.summary ? Number(planned.study.summary.errors || 0) : 0;
     if (!dryrun && blocking) {
@@ -2660,13 +2985,13 @@ async function launchRun(name, f, dryrun) {
       }
       body.study_override = true;
       body.study_fingerprint = planned.study_fingerprint || '';
-      planned = await api.post(`/api/pipelines/${name}/preview`, body);
+      planned = await api.post(`/api/pipelines/${encodeURIComponent(name)}/preview`, body);
       if (!reconcilePlannedStudy(d, f, planned, true)) return;
     }
     body.plan_digest = planned.plan_digest || '';
     f.plan_digest = body.plan_digest;
     if (!dryrun && !runPlanResolution(planned).launch_safe) {
-      window.alert(`Real execution is blocked by unresolved RunPlan material:\n\n${explainUnsafeRunPlan(planned)}`);
+      notify(`Real execution is blocked by unresolved RunPlan material:\n\n${explainUnsafeRunPlan(planned)}`);
       return;
     }
     const mode = dryrun ? 'dry-run' : 'REAL RUN';
@@ -2680,16 +3005,16 @@ async function launchRun(name, f, dryrun) {
     body.idempotency_key = intent.key;
     if (pending.active) {
       const existingId = pending.job.session_id || pending.job.id;
-      window.alert(`This RunPlan already has a durable ${pending.job.state} job (${existingId}). No duplicate was launched.`);
+      notify(`This RunPlan already has a durable ${pending.job.state} job (${existingId}). No duplicate was launched.`, 'info');
       await refreshRunQueue();
       return;
     }
-    const res = await api.post(`/api/pipelines/${name}/run`, body);
+    const res = await api.post(`/api/pipelines/${encodeURIComponent(name)}/run`, body);
     if (!submissionIntentMustPersist(res)) clearSubmissionIntent(intent.slot);
     if (res.queue) state.runQueue = res.queue;
     openTerminal(res.session);
   } catch (e) {
-    window.alert('Could not launch run (retry will reuse the same safe intent):\n' + e.message);
+    notify('Could not launch run (retry will reuse the same safe intent):\n' + e.message);
     await refreshRunQueue();
   } finally {
     state.launching[name] = false;
@@ -2774,7 +3099,7 @@ function viewDag(view) {
     inner.append(el('div', { class: 'empty' }, '⟳ generating graph…'));
     const q = new URLSearchParams({ mode: f.mode, configfile: f.configfile, env: f.env });
     try {
-      const r = await api.get(`/api/pipelines/${d.name}/dag?${q}`);
+      const r = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}/dag?${q}`);
       state.dagResult[d.name] = r;
       showResult(r);
     } catch (e) { status.textContent = 'error: ' + e.message; inner.innerHTML = ''; }
@@ -2970,7 +3295,7 @@ async function viewCapsules(view) {
     slot.innerHTML = '';
     slot.append(el('div', { class: 'muted' }, 'Loading run capsules...'));
     try {
-      const data = await api.get(`/api/pipelines/${d.name}/capsules?limit=50`);
+      const data = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}/capsules?limit=50`);
       c.rows = data.capsules || [];
       c.diff = null;
       if (!c.left || (!c.rows.some(item => item.id === c.left) && c.left !== 'current')) c.left = c.rows[0] ? c.rows[0].id : '';
@@ -2996,7 +3321,7 @@ async function viewCapsules(view) {
     status.textContent = 'Computing bounded scientific diff...';
     try {
       const query = new URLSearchParams({ left: leftId, right: rightId });
-      const diff = await api.get(`/api/pipelines/${d.name}/capsules/compare?${query}`);
+      const diff = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}/capsules/compare?${query}`);
       if (request !== c.request || c.left !== leftId || c.right !== rightId) return;
       c.diff = diff;
       status.textContent = '';
@@ -3108,7 +3433,7 @@ function viewBrowse(view) {
   const openItem = async (item) => {
     if (!item.path) return;
     if (item.openAction === 'unavailable') {
-      window.alert('This file is too large or not eligible for browser opening. Its metadata is shown, but OmicsANG will not fetch its contents here.');
+      notify('This file is too large or not eligible for browser opening. Its metadata is shown, but OmicsANG will not fetch its contents here.');
       return;
     }
     if (item.openAction === 'browse' || item.kind === 'directory' || item.kind === 'dir') {
@@ -3202,7 +3527,7 @@ function viewBrowse(view) {
     try {
       const payload = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/browse/search`, {
         path: b.path || '', query: b.query.trim(), scope: b.scope || 'all', limit: 80,
-      });
+      }, { invalidate: false });
       if (request !== b.request || !view.isConnected) return;
       b.path = typeof payload.path === 'string' ? payload.path : b.path;
       b.breadcrumbs = Array.isArray(payload.breadcrumbs) ? payload.breadcrumbs : [];
@@ -3425,7 +3750,7 @@ function resultDirectoryManager(d, r, rf, onSourcesChanged) {
     if (!path) return;
     ds.busy = 'preview'; ds.error = ''; ds.message = `Previewing ${shortPath(path, 3)}…`; ds.preview = null; draw();
     try {
-      const payload = await api.post(`${endpoint}/preview`, { path });
+      const payload = await api.post(`${endpoint}/preview`, { path }, { invalidate: false });
       ds.preview = payload.preview || payload;
       ds.message = `Preview ready for ${shortPath(path, 3)}.`;
     } catch (e) {
@@ -3439,7 +3764,7 @@ function resultDirectoryManager(d, r, rf, onSourcesChanged) {
     try {
       const payload = await api.post(`${endpoint}/directories/search`, {
         query: String(ds.query || '').trim(), root_id: ds.rootId || '', limit: 40,
-      });
+      }, { invalidate: false });
       ds.candidates = payload.candidates || payload.items || payload.directories || [];
       const allowed = payload.allowed_roots || payload.allowedRoots || ds.allowedRoots || [];
       ds.allowedRoots = allowed.map(item => typeof item === 'string' ? null : ({
@@ -3791,7 +4116,7 @@ function viewConfig(view) {
   view.append(el('h2', {}, `Config · ${d.name}`));
   if (!files.length) { view.append(el('div', { class: 'empty' }, 'No config files detected.')); return; }
 
-  state.configSel = state.configSel || {};
+  state.configSel = state.configSel || nameMap();
   if (!files.includes(state.configSel[d.name])) state.configSel[d.name] = files[0];
   state.configMode = state.configMode || 'form';
 
@@ -3826,14 +4151,14 @@ function viewConfig(view) {
     if (state.configMode === 'raw') {
       const ta = el('textarea', { spellcheck: 'false' }); host.append(ta);
       status.textContent = 'loading…';
-      try { ta.value = await api.text(`/api/file?pipeline=${d.name}&path=${encodeURIComponent(path)}`); status.textContent = ''; }
+      try { ta.value = await api.text(`/api/file?pipeline=${encodeURIComponent(d.name)}&path=${encodeURIComponent(path)}`); status.textContent = ''; }
       catch (e) { status.textContent = e.message; }
       formApi = { raw: true, collect: () => ta.value };
       return;
     }
     status.textContent = 'parsing…';
     let form;
-    try { form = await api.get(`/api/pipelines/${d.name}/config_form?path=${encodeURIComponent(path)}`); }
+    try { form = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}/config_form?path=${encodeURIComponent(path)}`); }
     catch (e) { state.configMode = 'raw'; syncModes(); status.textContent = 'not form-friendly — showing raw'; return renderBody(); }
     status.textContent = '';
     const rows = [];
@@ -3849,7 +4174,7 @@ function viewConfig(view) {
     if (!formApi || formApi.raw) { status.textContent = 'switch to Form mode to validate'; return; }
     formApi.rows.forEach(r => r.clear());
     try {
-      const res = await api.post(`/api/pipelines/${d.name}/config_validate`, { path: state.configSel[d.name], fields: formApi.collect() });
+      const res = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/config_validate`, { path: state.configSel[d.name], fields: formApi.collect() }, { invalidate: false });
       showErrors(res.errors || []);
     } catch (e) { status.textContent = 'error: ' + e.message; }
   };
@@ -3858,13 +4183,13 @@ function viewConfig(view) {
     if (!formApi) { status.textContent = 'still loading…'; return; }
     status.textContent = 'saving…';
     if (formApi && formApi.raw) {
-      try { await api.post(`/api/file?pipeline=${d.name}`, { path: state.configSel[d.name], content: formApi.collect() }); status.textContent = 'saved ✓ (backup written)'; }
+      try { await api.post(`/api/file?pipeline=${encodeURIComponent(d.name)}`, { path: state.configSel[d.name], content: formApi.collect() }); status.textContent = 'saved ✓ (backup written)'; }
       catch (e) { status.textContent = 'error: ' + e.message; }
       return;
     }
     formApi.rows.forEach(r => r.clear());
     try {
-      const res = await api.post(`/api/pipelines/${d.name}/config_save`, { path: state.configSel[d.name], fields: formApi.collect() });
+      const res = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/config_save`, { path: state.configSel[d.name], fields: formApi.collect() });
       showErrors(res.errors || []);
       status.textContent = res.ok ? `saved ✓ (backup ${res.backup})` : 'not saved — fix the errors above';
     } catch (e) { status.textContent = 'error: ' + e.message; }
@@ -3935,7 +4260,7 @@ function sraDownloadBody(f) {
 
 async function loadSraGeoInfo(d, f, shouldRender = true) {
   try {
-    f.info = await api.get(`/api/pipelines/${d.name}/sra_geo/info`);
+    f.info = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}/sra_geo/info`);
     f.destination = f.destination || f.info.default_destination || 'raw_files/sra';
   } catch (e) {
     f.status = 'error: ' + e.message;
@@ -3966,7 +4291,7 @@ function viewSraGeo(view) {
     f.status = 'searching NCBI...';
     viewSraGeoRefresh(d);
     try {
-      f.results = await api.post(`/api/pipelines/${d.name}/sra_geo/search`, {
+      f.results = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/sra_geo/search`, {
         db: f.db,
         term: f.term,
         limit: f.limit,
@@ -4090,7 +4415,7 @@ function sraDownloadPanel(d, f) {
     f.status = 'validating download plan...';
     viewSraGeoRefresh(d);
     try {
-      const res = await api.post(`/api/pipelines/${d.name}/sra_geo/preview`, sraDownloadBody(f));
+      const res = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/sra_geo/preview`, sraDownloadBody(f));
       f.preview = res.plan;
       f.status = 'download plan ready';
     } catch (e) {
@@ -4109,7 +4434,7 @@ function sraDownloadPanel(d, f) {
     f.status = 'starting download session...';
     viewSraGeoRefresh(d);
     try {
-      const res = await api.post(`/api/pipelines/${d.name}/sra_geo/download`, sraDownloadBody(f));
+      const res = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/sra_geo/download`, sraDownloadBody(f));
       f.preview = res.plan;
       f.status = 'download started';
       openTerminal(res.session);
@@ -4216,12 +4541,14 @@ function dirRank(name) {
   return DIR_ORDER.has(name) ? DIR_ORDER.get(name) : 1000;
 }
 
+const CODE_NAME_COLLATOR = new Intl.Collator(undefined, { sensitivity: 'base' });
+
 function codeSort(a, b) {
   if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
   const ar = a.type === 'dir' ? dirRank(a.name) : fileRank(a.name);
   const br = b.type === 'dir' ? dirRank(b.name) : fileRank(b.name);
   if (ar !== br) return ar - br;
-  return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+  return CODE_NAME_COLLATOR.compare(a.name, b.name);
 }
 
 function buildCodeTree(files) {
@@ -4311,14 +4638,24 @@ function splitComment(line, marker = '#') {
 const HIGHLIGHT_RANGE_LIMIT = 12000;
 const HIGHLIGHT_BUDGET_EXCEEDED = Symbol('highlight-budget-exceeded');
 let highlightRangesRemaining = Infinity;
-let lastHighlightWasCapped = false;
+
+const globalPatternCache = new WeakMap();
+function globalPattern(re) {
+  let compiled = globalPatternCache.get(re);
+  if (!compiled) {
+    compiled = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+    globalPatternCache.set(re, compiled);
+  }
+  compiled.lastIndex = 0;
+  return compiled;
+}
 
 function collectRanges(text, patterns) {
   const ranges = [];
   const occupied = [];
   const overlaps = (s, e) => occupied.some(r => s < r.e && e > r.s);
   patterns.forEach((p) => {
-    const re = new RegExp(p.re.source, p.re.flags.includes('g') ? p.re.flags : p.re.flags + 'g');
+    const re = globalPattern(p.re);
     let m;
     while ((m = re.exec(text)) !== null) {
       const raw = m[0];
@@ -4489,34 +4826,58 @@ function editorLanguageForPath(path, fallback = 'text') {
   return String(fallback || 'text').toLowerCase();
 }
 
-function highlightCode(src, lang, path = '') {
+function highlightLine(line, mode, markdownFile) {
+  // Token-range collection is intentionally skipped for pathological
+  // generated lines so a single dense line cannot freeze the editor.
+  if (line.length > 5000) return escapeHtml(line);
+  if (mode === 'snakemake') return highlightSnake(line);
+  if (mode === 'yaml') return highlightYaml(line);
+  if (mode === 'toml') return highlightToml(line);
+  if (mode === 'json' || mode === 'jsonl') return highlightJson(line);
+  if (mode === 'python') return highlightHashCommentLang(line, PY_PATTERNS);
+  if (mode === 'r') return highlightHashCommentLang(line, R_PATTERNS);
+  if (mode === 'shell') return highlightHashCommentLang(line, SH_PATTERNS);
+  if (mode === 'javascript' || mode === 'typescript' || mode === 'css' || mode === 'html') return highlightJsCss(line);
+  if (mode === 'markdown' || markdownFile) return highlightMarkdown(line);
+  return highlightHashCommentLang(line, []);
+}
+
+// Line highlighters depend only on the line and its mode, so an edit re-tokens
+// the changed lines instead of the whole document on every keystroke.
+const HIGHLIGHT_LINE_CACHE_LIMIT = 40000;
+const highlightLineCache = new Map();
+
+// Highlight only lines [first, last].  The editor paints just the rows near the
+// viewport, so the cost of a keystroke or scroll no longer grows with the file.
+function highlightLineRange(lines, first, last, lang, path = '') {
   const file = path.toLowerCase();
   const mode = editorLanguageForPath(file, lang);
-  highlightRangesRemaining = HIGHLIGHT_RANGE_LIMIT;
-  lastHighlightWasCapped = false;
+  const markdownFile = file.endsWith('.md');
+  const prefix = `${mode}\0${markdownFile ? 1 : 0}\0`;
+  const out = [];
   try {
-    return src.split('\n').map((line) => {
-      // Token-range collection is intentionally skipped for pathological
-      // generated lines so a single dense line cannot freeze the editor.
-      if (line.length > 5000) return escapeHtml(line);
-      if (mode === 'snakemake') return highlightSnake(line);
-      if (mode === 'yaml') return highlightYaml(line);
-      if (mode === 'toml') return highlightToml(line);
-      if (mode === 'json' || mode === 'jsonl') return highlightJson(line);
-      if (mode === 'python') return highlightHashCommentLang(line, PY_PATTERNS);
-      if (mode === 'r') return highlightHashCommentLang(line, R_PATTERNS);
-      if (mode === 'shell') return highlightHashCommentLang(line, SH_PATTERNS);
-      if (mode === 'javascript' || mode === 'typescript' || mode === 'css' || mode === 'html') return highlightJsCss(line);
-      if (mode === 'markdown' || file.endsWith('.md')) return highlightMarkdown(line);
-      return highlightHashCommentLang(line, []);
-    }).join('\n');
-  } catch (error) {
-    if (error !== HIGHLIGHT_BUDGET_EXCEEDED) throw error;
-    lastHighlightWasCapped = true;
-    return escapeHtml(src);
+    for (let index = first; index <= last; index += 1) {
+      const line = lines[index] || '';
+      const key = prefix + line;
+      let entry = highlightLineCache.get(key);
+      if (!entry) {
+        highlightRangesRemaining = HIGHLIGHT_RANGE_LIMIT;
+        let html;
+        try { html = highlightLine(line, mode, markdownFile); }
+        catch (error) {
+          if (error !== HIGHLIGHT_BUDGET_EXCEEDED) throw error;
+          html = escapeHtml(line);  // one pathologically dense line stays plain
+        }
+        entry = { html, ranges: HIGHLIGHT_RANGE_LIMIT - highlightRangesRemaining };
+        if (highlightLineCache.size >= HIGHLIGHT_LINE_CACHE_LIMIT) highlightLineCache.clear();
+        highlightLineCache.set(key, entry);
+      }
+      out.push(entry.html);
+    }
   } finally {
     highlightRangesRemaining = Infinity;
   }
+  return out.join('\n');
 }
 
 function codeState(name) {
@@ -4883,7 +5244,7 @@ function viewCode(view) {
     c.packageHelpError = '';
     renderPackageHelp();
     try {
-      const payload = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/help`, { path });
+      const payload = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/help`, { path }, { invalidate: false });
       if (request !== c.packageHelpRequest || !view.isConnected) return;
       c.packageHelp = payload || { packages: [] };
       c.packageHelpPath = path;
@@ -5024,6 +5385,7 @@ function viewCode(view) {
       conflict.disk = await api.post(
         `/api/pipelines/${encodeURIComponent(d.name)}/code/read`,
         { path: conflict.path },
+        { invalidate: false },
       );
     } catch (readError) {
       conflict.diskError = readError.status === 404 ? 'the file no longer exists' : readError.message;
@@ -5523,19 +5885,55 @@ function viewCode(view) {
     });
   };
 
+  // The highlight layer holds only the rows around the viewport, shifted into
+  // place, so its DOM stays a few hundred lines however long the file is.
+  const HIGHLIGHT_OVERSCAN = 60;
+  let highlightLines = [''];
+  let highlightFirst = 0;
+  let highlightLast = -1;
+  let highlightLineHeight = 20;
+
+  const placeHighlight = () => {
+    highlight.style.transform =
+      `translate(${-editor.scrollLeft}px, ${highlightFirst * highlightLineHeight - editor.scrollTop}px)`;
+  };
+
+  const renderHighlightWindow = (force) => {
+    if (largeFileMode) return;
+    const metrics = editorMetrics();
+    const first = Math.max(0, Math.floor((editor.scrollTop - metrics.paddingTop) / metrics.lineHeight) - 1);
+    const last = Math.min(
+      highlightLines.length - 1,
+      Math.ceil((editor.scrollTop + editor.clientHeight - metrics.paddingTop) / metrics.lineHeight) + 1,
+    );
+    const stale = force || metrics.lineHeight !== highlightLineHeight ||
+      first < highlightFirst || last > highlightLast;
+    highlightLineHeight = metrics.lineHeight;
+    if (stale) {
+      highlightFirst = Math.max(0, first - HIGHLIGHT_OVERSCAN);
+      highlightLast = Math.min(highlightLines.length - 1, last + HIGHLIGHT_OVERSCAN);
+      const html = highlightLineRange(highlightLines, highlightFirst, highlightLast,
+        c.language || '', c.selected || c.loadedPath || '');
+      highlight.innerHTML = html || '<br>';
+    }
+    placeHighlight();
+  };
+
   const updateHighlight = () => {
     if (largeFileMode) {
       highlight.textContent = '';
+      highlight.style.transform = '';
       largeFileStatus.textContent = 'Large file · syntax colors paused';
       largeFileStatus.classList.remove('hidden');
     } else {
-      const html = highlightCode(editor.value || '', c.language || '', c.selected || c.loadedPath || '');
-      highlight.innerHTML = html || '<br>';
-      largeFileStatus.textContent = lastHighlightWasCapped
-        ? 'Dense file · syntax colors paused' : 'Large file · syntax colors paused';
-      largeFileStatus.classList.toggle('hidden', !lastHighlightWasCapped);
+      highlightLines = (editor.value || '').split('\n');
+      largeFileStatus.classList.add('hidden');
+      renderHighlightWindow(true);
     }
   };
+
+  if (typeof ResizeObserver === 'function')
+    new ResizeObserver(() => { if (view.isConnected) renderHighlightWindow(false); }).observe(editor);
 
   const scheduleHighlight = () => {
     if (highlightFrame) return;
@@ -5548,7 +5946,9 @@ function viewCode(view) {
   };
 
   const syncHighlightScroll = () => {
-    highlight.style.transform = `translate(${-editor.scrollLeft}px, ${-editor.scrollTop}px)`;
+    // Rendered synchronously: the textarea's own text is transparent, so rows
+    // scrolled into view must be painted before the frame is shown.
+    renderHighlightWindow(false);
     inlineCompletion.style.transform = `translate(${-editor.scrollLeft}px, ${-editor.scrollTop}px)`;
     if (largeFileMode) updateLineNumbers();
     else lineNumbers.style.transform = `translateY(${-editor.scrollTop}px)`;
@@ -5707,7 +6107,7 @@ function viewCode(view) {
     renderTree();
     setStatus('scanning files…');
     try {
-      const res = await api.get(`/api/pipelines/${d.name}/files?limit=1200`);
+      const res = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}/files?limit=1200`);
       c.files = res.files || [];
       c.filesScan = res.scan || null;
       c.loaded = true;
@@ -5769,7 +6169,7 @@ function viewCode(view) {
         !window.confirm('Discard unsaved changes and reload from disk?')) return;
     setStatus('loading…');
     try {
-      const r = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/read`, { path });
+      const r = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/read`, { path }, { invalidate: false });
       resetTo(r);
       if (line) jumpToLine(line);
       setStatus('loaded');
@@ -5795,7 +6195,7 @@ function viewCode(view) {
     }
     setStatus('saving…');
     try {
-      const r = await api.post(`/api/pipelines/${d.name}/code`, {
+      const r = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code`, {
         path: c.selected,
         content: editor.value,
         create_dirs: true,
@@ -5885,7 +6285,7 @@ function viewCode(view) {
     if (!path) return;
     setStatus('creating folder…');
     try {
-      const r = await api.post(`/api/pipelines/${d.name}/code/mkdir`, { path });
+      const r = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/mkdir`, { path });
       c.expanded.add(r.path);
       setStatus('folder created');
       await loadFiles(true);
@@ -5900,7 +6300,7 @@ function viewCode(view) {
     if (!dst || dst === c.loadedPath) return;
     setStatus('renaming…');
     try {
-      const r = await api.post(`/api/pipelines/${d.name}/code/move`, { src: c.loadedPath, dst, create_dirs: true });
+      const r = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/move`, { src: c.loadedPath, dst, create_dirs: true });
       const t = activeTab();
       if (t) Object.assign(t, { key: r.path, path: r.path, loadedPath: r.path, size: r.size, mtime: r.mtime, language: r.language });
       c.activeTab = r.path;
@@ -5922,7 +6322,7 @@ function viewCode(view) {
     if (!dst) return;
     setStatus('duplicating…');
     try {
-      const r = await api.post(`/api/pipelines/${d.name}/code/copy`, { src: c.loadedPath, dst, create_dirs: true });
+      const r = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/copy`, { src: c.loadedPath, dst, create_dirs: true });
       await loadFiles(true);
       await openFile(r.path, false, true);
       setStatus('duplicated');
@@ -5937,7 +6337,7 @@ function viewCode(view) {
     const doomed = c.loadedPath;
     setStatus('deleting…');
     try {
-      const r = await api.post(`/api/pipelines/${d.name}/code/delete`, { path: doomed });
+      const r = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/code/delete`, { path: doomed });
       c.tabs = c.tabs.filter(t => t.path !== doomed && t.loadedPath !== doomed);
       const next = c.tabs[0];
       if (next) activateTab(next);
@@ -5966,7 +6366,7 @@ function viewCode(view) {
     if (!fix) return;
     setStatus('applying quick fix...');
     try {
-      const res = await api.post(`/api/pipelines/${d.name}/diagnostics/fix`, fix);
+      const res = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/diagnostics/fix`, fix);
       setStatus(res.backup ? `fixed · backup ${res.backup}` : 'fixed', 'ok');
       await loadFiles(true);
       if (res.path && fix.kind !== 'dir') await openFile(res.path, false, true, item.line || 1);
@@ -6035,7 +6435,7 @@ function viewCode(view) {
     diagnosticsPanel.append(el('div', { class: 'muted' }, 'running diagnostics…'));
     setStatus('running diagnostics…');
     try {
-      c.diagnostics = await api.get(`/api/pipelines/${d.name}/diagnostics`);
+      c.diagnostics = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}/diagnostics`);
       const s = c.diagnostics.summary || {};
       setStatus(`${s.error || 0} errors · ${s.warning || 0} warnings`, s.error ? 'err' : 'ok');
       renderDiagnostics();
@@ -6368,7 +6768,7 @@ function renderSlurmJobs(host, jobs, scopedPipeline = '') {
         const path = j.durable_job_id ? `/api/jobs/${j.durable_job_id}/cancel` : `/api/slurm/jobs/${j.job_id}/cancel`;
         await api.post(path, {}); await refreshSlurm(true);
       }
-      catch (e) { window.alert('Cancel failed: ' + e.message); }
+      catch (e) { notify('Cancel failed: ' + e.message); }
     } }, 'Cancel'));
     else if (j.job_id && j.benchtop_owned && !terminal && !canCancel) {
       acts.append(el('span', { class: 'muted', title: 'Cancellation requires both squeue and scancel' }, 'cancel unavailable'));
@@ -6379,7 +6779,7 @@ function renderSlurmJobs(host, jobs, scopedPipeline = '') {
           try {
             await api.post(`/api/jobs/${j.durable_job_id}/resolve`, { action: 'reconcile_now' });
             await refreshSlurm(true);
-          } catch (e) { window.alert('Reconcile failed: ' + e.message); }
+          } catch (e) { notify('Reconcile failed: ' + e.message); }
         } }, 'Reconcile'),
         el('button', { class: 'ghost sm danger-outline', onclick: async () => {
           const reason = window.prompt('Only after checking scheduler evidence: why was this job not submitted?');
@@ -6390,7 +6790,7 @@ function renderSlurmJobs(host, jobs, scopedPipeline = '') {
               action: 'mark_not_submitted', reason: reason.trim(),
             });
             await refreshSlurm(true);
-          } catch (e) { window.alert('Resolve failed: ' + e.message); }
+          } catch (e) { notify('Resolve failed: ' + e.message); }
         } }, 'Mark not submitted'),
       );
     }
@@ -6444,7 +6844,7 @@ async function viewGithub(view) {
   const slot = el('div', {}, el('div', { class: 'muted' }, 'loading GitHub state...'));
   view.append(slot);
   try {
-    const data = await api.get(`/api/pipelines/${d.name}/github`);
+    const data = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}/github`);
     state.github[d.name] = data;
     if (state.detail && state.detail.name === d.name && state.tab === 'github') renderGithubContent(slot, d, data);
   } catch (e) {
@@ -6466,12 +6866,12 @@ function renderGithubContent(slot, d, gh, initialOutput = '', initialOk = true) 
     if (confirmText && !window.confirm(confirmText)) return;
     setOutput(`${label}...`);
     try {
-      const res = await api.post(`/api/pipelines/${d.name}/github/${endpoint}`, body);
+      const res = await api.post(`/api/pipelines/${encodeURIComponent(d.name)}/github/${endpoint}`, body);
       const text = res.output || JSON.stringify(res, null, 2);
       setOutput(text, !!res.ok);
       if (res.ok) {
         try {
-          const fresh = await api.get(`/api/pipelines/${d.name}/github`);
+          const fresh = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}/github`);
           state.github[d.name] = fresh;
           if (state.detail && state.detail.name === d.name && state.tab === 'github') {
             renderGithubContent(slot, d, fresh, text, true);
@@ -6687,7 +7087,7 @@ function viewAgents(view) {
     try {
       const res = await api.post('/api/worktrees', { pipeline: d.name, branch: requestedBranch });
       wtStatus.textContent = res.ok ? 'created ✓' : 'error';
-      state.detail = await api.get(`/api/pipelines/${d.name}`); d.worktrees = state.detail.worktrees; refreshWt();
+      state.detail = await api.get(`/api/pipelines/${encodeURIComponent(d.name)}`); d.worktrees = state.detail.worktrees; refreshWt();
       if (res.ok) {
         const { session } = await api.post('/api/agents', {
           pipeline: d.name,
@@ -6883,9 +7283,9 @@ async function fleetPR(jobId, index, t) {
   try {
     const res = await api.post(`/api/fleet/${jobId}/pr`, { index, message: msg });
     const pr = res.steps && res.steps.pr;
-    window.alert(pr && pr.url ? 'PR opened:\n' + pr.url : 'Result:\n' + JSON.stringify(res.steps, null, 1).slice(0, 600));
+    notify(pr && pr.url ? 'PR opened:\n' + pr.url : 'Result:\n' + JSON.stringify(res.steps, null, 1).slice(0, 600), 'info');
     render();
-  } catch (e) { window.alert('error: ' + e.message); }
+  } catch (e) { notify('error: ' + e.message); }
 }
 
 /* ---------------- terminal ---------------- */
@@ -6913,7 +7313,7 @@ function viewTerminal(view) {
     el('span', { class: 'tag' }, status),
     terminalToggleBtn,
     el('button', { class: 'ghost sm', style: 'margin-left:auto',
-      onclick: () => fitTerminal(sid) }, 'Fit'),
+      onclick: () => fitTerminal(sid, { focus: true }) }, 'Fit'),
     el('button', { class: 'danger sm', disabled: live ? null : '', onclick: async (e) => {
       e.currentTarget.disabled = true;
       e.currentTarget.textContent = 'Canceling…';
@@ -6921,7 +7321,7 @@ function viewTerminal(view) {
         await api.post(`/api/sessions/${sid}/kill`);
         await refreshRunQueue();
       } catch (err) {
-        window.alert('Cancel failed: ' + err.message);
+        notify('Cancel failed: ' + err.message);
         e.currentTarget.disabled = false;
         e.currentTarget.textContent = 'Cancel';
       }
@@ -6938,7 +7338,7 @@ function viewTerminal(view) {
   view.append(bar, stage);
   mount.appendChild(rec.host);
   applyPanelVisibility(state.uiPrefs);
-  if (state.uiPrefs.terminalOpen) setTimeout(() => fitTerminal(sid), 20);
+  if (state.uiPrefs.terminalOpen) setTimeout(() => fitTerminal(sid, { focus: true }), 20);
 }
 
 function openTerminal(session) {
@@ -6949,7 +7349,10 @@ function openTerminal(session) {
       scrollback: 20000, theme: { background: '#0b0e14', foreground: '#d6deeb', cursor: '#4f9cff' } });
     const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws/term/${session.id}`);
+    // The upgrade cannot carry custom headers; the page secret travels as an
+    // offered subprotocol and the server selects the fixed one.
+    const ws = new WebSocket(`${proto}://${location.host}/ws/term/${session.id}`,
+      ['omicsang.term.v1', `omicsang.csrf.${csrfToken}`]);
     ws.binaryType = 'arraybuffer';
     const rec = { term, fit, ws, host, session, exited: false, usedAt: Date.now() };
     ws.onmessage = (ev) => {
@@ -6963,8 +7366,17 @@ function openTerminal(session) {
       } else term.write(new Uint8Array(ev.data));
     };
     term.onData((dd) => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: dd })); });
-    rec.sendResize = () => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', rows: term.rows, cols: term.cols })); };
+    // Each resize makes a full-screen program repaint, so the same size is
+    // never announced twice.
+    rec.sendResize = () => {
+      const size = `${term.rows}x${term.cols}`;
+      if (ws.readyState !== 1 || rec.sentSize === size) return;
+      rec.sentSize = size;
+      ws.send(JSON.stringify({ type: 'resize', rows: term.rows, cols: term.cols }));
+    };
     term.onResize(rec.sendResize);
+    // The first fit usually runs before the socket is open.
+    ws.onopen = () => rec.sendResize();
     terminals.set(session.id, rec);
   }
   state.view = 'pipeline';
@@ -6974,12 +7386,20 @@ function openTerminal(session) {
   pollSessions();
 }
 
-function fitTerminal(sid) {
+// `focus` is for a deliberate action on the terminal; a layout-driven refit
+// must not pull the keyboard away from whatever control caused it.
+function fitTerminal(sid, { focus = false } = {}) {
   const rec = terminals.get(sid); if (!rec) return;
   if (!state.uiPrefs.terminalOpen || !rec.host.closest('.term-mount')) return;
-  try { rec.fit.fit(); rec.sendResize(); rec.term.focus(); } catch (e) {}
+  try { rec.fit.fit(); rec.sendResize(); if (focus) rec.term.focus(); } catch (e) {}
 }
-window.addEventListener('resize', () => { if (state.tab === 'terminal' && state.focusedSession) fitTerminal(state.focusedSession); });
+let windowResizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(windowResizeTimer);
+  windowResizeTimer = setTimeout(() => {
+    if (state.tab === 'terminal' && state.focusedSession) fitTerminal(state.focusedSession);
+  }, 100);
+});
 
 function releaseIdleTerminals() {
   const release = window.OmicsPerformance.terminalsToRelease(terminals, {
@@ -7020,11 +7440,14 @@ async function debugWithClaude(sessionId) {
     });
     openTerminal(session);
   } catch (e) {
-    window.alert(`Could not launch debug agent:\n${e.message}`);
+    notify(`Could not launch debug agent:\n${e.message}`);
   }
 }
 
 /* ---------------- sessions bar ---------------- */
+// The poller waits for its task to settle before rescheduling, so a request
+// that never completes would otherwise stop status updates until reload.
+const SESSION_POLL_TIMEOUT_MS = 10000;
 const sessionPoller = window.OmicsPerformance.createPoller({
   task: updateSessions,
   visible: () => !document.hidden,
@@ -7033,11 +7456,40 @@ const sessionPoller = window.OmicsPerformance.createPoller({
 });
 function pollSessions() { return sessionPoller.run(); }
 
+// Status on screen is only as fresh as the last successful poll.  Say so when
+// polls fail, instead of silently showing run states that may have changed.
+let failedPolls = 0;
+function reportConnection(error) {
+  let banner = document.getElementById('connection-banner');
+  if (!error) {
+    failedPolls = 0;
+    if (banner) banner.remove();
+    return;
+  }
+  failedPolls += 1;
+  const signedOut = error.status === 401 || error.status === 403;
+  if (!signedOut && failedPolls < 2) return;
+  if (!banner) {
+    banner = el('div', { id: 'connection-banner', class: 'connection-banner', role: 'alert' });
+    document.body.prepend(banner);
+  }
+  const key = signedOut ? 'signed-out' : 'unreachable';
+  if (banner.dataset.kind === key) return;
+  banner.dataset.kind = key;
+  banner.replaceChildren(
+    el('span', {}, signedOut
+      ? 'This tab is no longer signed in (OmicsANG was restarted or the session expired). Run states shown here are out of date.'
+      : 'The OmicsANG server is not responding. Run states shown here may be out of date; retrying automatically.'),
+    signedOut
+      ? el('button', { type: 'button', class: 'ghost sm', onclick: () => { rememberPageSecret(''); window.location.reload(); } }, 'Sign in again')
+      : el('button', { type: 'button', class: 'ghost sm', onclick: () => pollSessions() }, 'Retry now'));
+}
+
 async function updateSessions() {
   try {
     const [sessions, queue] = await Promise.all([
-      api.get('/api/sessions'),
-      api.get('/api/run_queue').catch(() => state.runQueue),
+      api.get('/api/sessions', { signal: AbortSignal.timeout(SESSION_POLL_TIMEOUT_MS) }),
+      api.get('/api/run_queue', { signal: AbortSignal.timeout(SESSION_POLL_TIMEOUT_MS) }).catch(() => state.runQueue),
     ]);
     const previous = new Map(state.sessions.map(s => [s.id, s.status]));
     const changed = previous.size > 0 && sessions.some(s => previous.get(s.id) !== s.status);
@@ -7048,25 +7500,40 @@ async function updateSessions() {
     }
     state.sessions = sessions;
     state.runQueue = queue || state.runQueue;
-  } catch (e) { return; }
-  const wrap = $('#session-chips'); wrap.innerHTML = '';
-  for (const s of state.sessions.slice(0, 12)) {
-    if (terminals.has(s.id)) {
-      const rec = terminals.get(s.id);
-      rec.session = s;
-      rec.exited = !['created', 'queued', 'running'].includes(s.status);
+    reportConnection(null);
+  } catch (e) { reportConnection(e); return; }
+  for (const s of state.sessions) {
+    if (!terminals.has(s.id)) continue;
+    const rec = terminals.get(s.id);
+    rec.session = s;
+    rec.exited = !['created', 'queued', 'running'].includes(s.status);
+  }
+  // Rebuilding identical DOM every tick resets hover and focus, and swallows a
+  // click whose press and release straddle the refresh.
+  const shown = state.sessions.slice(0, 12);
+  const chipKey = JSON.stringify([state.focusedSession, shown.map(s => [s.id, s.status, s.title, s.kind])]);
+  const wrap = $('#session-chips');
+  if (wrap.dataset.rendered !== chipKey) {
+    wrap.dataset.rendered = chipKey;
+    wrap.innerHTML = '';
+    for (const s of shown) {
+      const chip = el('div', { class: `chip ${state.focusedSession === s.id ? 'active' : ''}`,
+        onclick: () => { focusOrOpen(s); } },
+        el('span', { class: `dot ${s.status}` }), s.title);
+      if (s.status === 'failed' && s.kind === 'run')
+        chip.append(el('span', { style: 'color:var(--err)', title: 'debug with Claude',
+          onclick: (e) => { e.stopPropagation(); debugWithClaude(s.id); } }, ' ✦'));
+      wrap.append(chip);
     }
-    const chip = el('div', { class: `chip ${state.focusedSession === s.id ? 'active' : ''}`,
-      onclick: () => { focusOrOpen(s); } },
-      el('span', { class: `dot ${s.status}` }), s.title);
-    if (s.status === 'failed' && s.kind === 'run')
-      chip.append(el('span', { style: 'color:var(--err)', title: 'debug with Claude',
-        onclick: (e) => { e.stopPropagation(); debugWithClaude(s.id); } }, ' ✦'));
-    wrap.append(chip);
   }
   releaseIdleTerminals();
-  renderMonitor();
+  const monitorKey = JSON.stringify([state.sessions, state.runQueue]);
+  if (monitorKey !== lastMonitorPollKey) {
+    lastMonitorPollKey = monitorKey;
+    renderMonitor();
+  }
 }
+let lastMonitorPollKey = '';
 
 async function focusOrOpen(s) {
   const pipeline = s.meta && s.meta.pipeline;
@@ -7120,5 +7587,6 @@ window.addEventListener('beforeunload', (e) => {
 });
 
 boot().catch(e => {
+  if (e && e.code === 'unauthenticated') { renderSignIn(); return; }
   document.body.replaceChildren(el('pre', { class: 'boot-error' }, `OmicsANG failed to start:\n${e.message}`));
 });

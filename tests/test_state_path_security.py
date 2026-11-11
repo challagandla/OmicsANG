@@ -158,3 +158,55 @@ class StatePathSecurityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AtomicWriteRaceTest(unittest.TestCase):
+    """The write is pinned to the verified directory, not to its name."""
+
+    def test_component_swapped_after_the_check_cannot_redirect_the_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo = root / "repo"
+            (repo / "config").mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            target = repo / "config" / "config.yaml"
+
+            def swap(path: Path) -> Path:
+                # Simulate a concurrent writer winning the race between the
+                # symlink check and the first filesystem operation.
+                (repo / "config").rmdir()
+                (repo / "config").symlink_to(outside, target_is_directory=True)
+                return path
+
+            with mock.patch.object(
+                fs_policy, "_reject_symlink_components", side_effect=swap
+            ):
+                with self.assertRaises(fs_policy.PathPolicyError):
+                    fs_policy.atomic_write_text(target, "x: 1\n")
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_missing_parents_are_created_and_no_temporary_file_remains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            target = root / "a" / "b" / "file.txt"
+            fs_policy.atomic_write_text(target, "one\n")
+            fs_policy.atomic_write_text(target, "two\n")
+            self.assertEqual(target.read_text(encoding="utf-8"), "two\n")
+            self.assertEqual([p.name for p in target.parent.iterdir()], ["file.txt"])
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+
+    def test_symlink_target_and_hard_links_are_still_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            victim = root / "victim"
+            victim.write_text("keep\n", encoding="utf-8")
+            link = root / "link.txt"
+            link.symlink_to(victim)
+            with self.assertRaises(fs_policy.PathPolicyError):
+                fs_policy.atomic_write_text(link, "x\n")
+            hard = root / "hard.txt"
+            os.link(victim, hard)
+            with self.assertRaises(fs_policy.PathPolicyError):
+                fs_policy.atomic_write_text(hard, "x\n")
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep\n")

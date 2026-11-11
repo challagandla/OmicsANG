@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 import hashlib
 import json
 import re
@@ -19,6 +20,7 @@ from urllib.parse import unquote, urlsplit
 import yaml
 
 from . import pipelines as pipeline_tools
+from . import yaml_io
 from .pipelines import Pipeline
 
 SCHEMA_VERSION = 1
@@ -826,7 +828,7 @@ def _profile_configuration(root: Path, profile: str) -> tuple[dict | None, dict]
             parsed = (
                 {"__benchtop_static_parse_error__": True}
                 if path.stat().st_size > MAX_CONFIG_PARSE_BYTES
-                else yaml.safe_load(path.read_text(encoding="utf-8"))
+                else yaml.safe_load(yaml_io.read_text(path))
             )
         except Exception:
             parsed = {"__benchtop_static_parse_error__": True}
@@ -1176,7 +1178,7 @@ def _reference_artifacts(
                     f"config-too-large-for-static-reference-scan:{config_path}"
                 )
                 continue
-            parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+            parsed = yaml.safe_load(yaml_io.read_text(path))
         except Exception:
             issues.append(f"config-unreadable-for-static-reference-scan:{config_path}")
             continue
@@ -1585,7 +1587,7 @@ def _output_roots(pipeline: Pipeline, configfile: str) -> list[str]:
     path = _declared_path(pipeline.path, selected)
     if path and path.is_file():
         try:
-            config = yaml.safe_load(path.read_text(encoding="utf-8"))
+            config = yaml.safe_load(yaml_io.read_text(path))
             if isinstance(config, dict) and config.get("results_dir"):
                 raw = str(config["results_dir"])
                 result_path = Path(raw).expanduser()
@@ -1598,35 +1600,42 @@ def _output_roots(pipeline: Pipeline, configfile: str) -> list[str]:
     return sorted(roots)
 
 
+_REDACT_USERINFO_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9._-])[^/@:\s]+@(?=[A-Za-z0-9.-]+:)"
+)
+_REDACT_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.-]*)=(.*)$", re.S)
+_REDACT_HEADER_RE = re.compile(r"^([^:\s]+):\s*(.*)$", re.S)
+_REDACT_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/@\s]+@")
+_REDACT_QUERY_RE = re.compile(
+    r"(?i)([?&](?:token|secret|password|passwd|credential|api[_-]?key)=)[^&\s]+"
+)
+_REDACT_INLINE_RE = re.compile(
+    r"(?i)(\b(?:token|secret|password|passwd|credential|api[_-]?key)\b\s*=\s*)[^\s,]+"
+)
+_REDACT_FLAG_RE = re.compile(
+    r"(?i)(--?(?:token|secret|password|passwd|credential|api[-_]?key|authorization|cookie)\s+)[^\s]+"
+)
+
+
 def redact_text(value: str) -> str:
-    text = str(value or "")
-    text = re.sub(
-        r"(?i)(?<![A-Za-z0-9._-])[^/@:\s]+@(?=[A-Za-z0-9.-]+:)",
-        "<redacted>@",
-        text,
-    )
-    assignment = re.match(r"^([A-Za-z_][A-Za-z0-9_.-]*)=(.*)$", text, re.S)
+    return _redact_text(str(value or ""))
+
+
+# Redaction is a pure function of its input, and the session list re-redacts
+# the same historical argv and metadata strings on every poll.
+@functools.lru_cache(maxsize=16384)
+def _redact_text(text: str) -> str:
+    text = _REDACT_USERINFO_RE.sub("<redacted>@", text)
+    assignment = _REDACT_ASSIGNMENT_RE.match(text)
     if assignment and SECRET_RE.search(assignment.group(1)):
         return assignment.group(1) + "=<redacted>"
-    header = re.match(r"^([^:\s]+):\s*(.*)$", text, re.S)
+    header = _REDACT_HEADER_RE.match(text)
     if header and SECRET_RE.search(header.group(1)):
         return header.group(1) + ": <redacted>"
-    text = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1<redacted>@", text)
-    text = re.sub(
-        r"(?i)([?&](?:token|secret|password|passwd|credential|api[_-]?key)=)[^&\s]+",
-        r"\1<redacted>",
-        text,
-    )
-    text = re.sub(
-        r"(?i)(\b(?:token|secret|password|passwd|credential|api[_-]?key)\b\s*=\s*)[^\s,]+",
-        r"\1<redacted>",
-        text,
-    )
-    text = re.sub(
-        r"(?i)(--?(?:token|secret|password|passwd|credential|api[-_]?key|authorization|cookie)\s+)[^\s]+",
-        r"\1<redacted>",
-        text,
-    )
+    text = _REDACT_URL_USERINFO_RE.sub(r"\1<redacted>@", text)
+    text = _REDACT_QUERY_RE.sub(r"\1<redacted>", text)
+    text = _REDACT_INLINE_RE.sub(r"\1<redacted>", text)
+    text = _REDACT_FLAG_RE.sub(r"\1<redacted>", text)
     return text
 
 

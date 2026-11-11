@@ -5,9 +5,12 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import errno
+import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +20,7 @@ import uvicorn
 from . import __version__, env_compat
 
 _BROWSER_COMMANDS = (("/usr/bin/xdg-open",), ("/usr/bin/gio", "open"))
+CONTROL_SOCKET_NAME = "control.sock"
 
 
 def _require_supported_platform(platform: str | None = None) -> None:
@@ -36,6 +40,15 @@ def _parser() -> argparse.ArgumentParser:
         description="Run OmicsANG for trusted local pipelines on loopback only.",
     )
     parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("open",),
+        help=(
+            "open: ask the OmicsANG already running on this --state for a fresh "
+            "one-time launch URL, for a new browser tab or after closing the last one"
+        ),
+    )
+    parser.add_argument(
         "--root", type=Path, help="directory containing pipeline repositories"
     )
     parser.add_argument("--state", type=Path, help="private OmicsANG state directory")
@@ -46,7 +59,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-browser",
         action="store_true",
-        help="show the one-time launch URL only on the controlling terminal",
+        help=(
+            "do not open the sign-in page in a browser; the one-time launch URL "
+            "is shown only on the controlling terminal either way"
+        ),
     )
     parser.add_argument(
         "--access-log",
@@ -110,11 +126,18 @@ def _write_launch_url_to_tty(url: str, *, tty_path: str = "/dev/tty") -> None:
 
 
 def _open_browser(
-    url: str,
+    page_url: str,
     *,
     commands: tuple[tuple[str, ...], ...] = _BROWSER_COMMANDS,
 ) -> bool:
-    """Launch a known Linux desktop opener without exposing its output streams."""
+    """Open the sign-in page, which carries no secret, in the desktop browser.
+
+    A command-line argument is readable by every local account through
+    ``/proc/<pid>/cmdline``, so anything with a fragment, query, or user
+    information is refused outright: only the bare address may be passed.
+    """
+    if any(mark in page_url for mark in "#?@") or not page_url.startswith("http://"):
+        raise ValueError("only the bare local address may be given to a browser")
     environment = os.environ.copy()
     # Do not let Python or desktop helpers honor a caller-supplied browser shell.
     environment.pop("BROWSER", None)
@@ -125,7 +148,7 @@ def _open_browser(
             continue
         try:
             process = subprocess.Popen(  # noqa: S603 - absolute executable allowlist
-                [*command, url],
+                [*command, page_url],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -138,26 +161,125 @@ def _open_browser(
         try:
             status = process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
-            # A still-running desktop handoff owns the request and all its streams
-            # remain disconnected from OmicsANG.
             return True
         if status == 0:
             return True
     return False
 
 
-def _deliver_launch_url(url: str, *, no_browser: bool) -> str:
-    """Deliver the capability outside redirectable process output streams."""
-    if not no_browser and _open_browser(url):
-        return "browser"
+def _deliver_launch_url(url: str, *, no_browser: bool = True) -> str:
+    """Show the capability on the controlling terminal, and only there.
+
+    Unless ``no_browser`` is set the browser is also opened at the bare address,
+    where the page asks for the launch code shown on the terminal.
+    """
     _write_launch_url_to_tty(url)
+    if not no_browser and _open_browser(url.partition("#")[0]):
+        return "browser"
     return "terminal"
+
+
+def _control_socket_path(state_dir: Path) -> Path:
+    return state_dir / CONTROL_SOCKET_NAME
+
+
+def _peer_is_this_user(writer: asyncio.StreamWriter) -> bool:
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return False
+    try:
+        raw = sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+    except OSError:
+        return False
+    _pid, uid, _gid = struct.unpack("3i", raw)
+    return uid == os.getuid()
+
+
+async def _start_control_server(state_dir: Path, base_url: str):
+    """Listen on a private socket that hands out fresh launch URLs.
+
+    The socket lives in the 0700 state directory and the peer's uid is checked
+    as well, so only this account can ask.  Contained agents cannot reach it:
+    the state directory is not mounted for them and they cannot create
+    unix-domain sockets.
+    """
+    from . import security
+
+    path = _control_socket_path(state_dir)
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            if _peer_is_this_user(writer) and line.strip() == b"launch-url":
+                code = security.AUTH_STATE.issue_launch_code()
+                reply = {"url": f"{base_url}#bootstrap={code}"}
+            else:
+                reply = {"error": "request refused"}
+            writer.write(json.dumps(reply).encode("utf-8") + b"\n")
+            await writer.drain()
+        except (OSError, asyncio.TimeoutError):
+            pass
+        finally:
+            writer.close()
+
+    try:
+        path.unlink(missing_ok=True)
+        previous = os.umask(0o177)
+        try:
+            server = await asyncio.start_unix_server(handle, path=str(path))
+        finally:
+            os.umask(previous)
+        os.chmod(path, 0o600)
+    except (OSError, ValueError):
+        # For example a state path too long for a socket address.  The server
+        # still works; only `omicsang open` is unavailable.
+        return None
+    return server
+
+
+def _request_launch_url(state_dir: Path) -> str:
+    """Ask the running server for a new one-time launch URL."""
+    path = _control_socket_path(state_dir)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(5.0)
+    try:
+        client.connect(str(path))
+        client.sendall(b"launch-url\n")
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except OSError as exc:
+        raise SystemExit(
+            f"error: no running OmicsANG answered for state {state_dir} "
+            f"({exc.strerror or exc}); start it first, or pass the same --state"
+        ) from None
+    finally:
+        client.close()
+    try:
+        url = json.loads(data.decode("utf-8")).get("url")
+    except (ValueError, AttributeError):
+        url = None
+    if not isinstance(url, str) or "#bootstrap=" not in url:
+        raise SystemExit("error: the running OmicsANG refused to issue a launch URL")
+    return url
 
 
 def _bind_listener(host: str, port: int) -> socket.socket:
     """Reserve the loopback listener before the application lifecycle starts."""
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    listener = socket.socket(family=family, type=socket.SOCK_STREAM)
+    # Name TCP explicitly: asyncio only sets TCP_NODELAY on accepted sockets
+    # whose protocol is IPPROTO_TCP, and without it Nagle plus delayed ACK adds
+    # about 40 ms to every keep-alive response.
+    listener = socket.socket(
+        family=family, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+    )
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         listener.bind((host, port))
@@ -203,11 +325,17 @@ class _LaunchServer(uvicorn.Server):
         self.launch_url = launch_url
         self.no_browser = no_browser
         self.launch_error: SystemExit | None = None
+        self.control_server = None
 
     async def startup(self, sockets=None) -> None:
         await super().startup(sockets=sockets)
         if not self.started:
             return
+        from . import settings
+
+        self.control_server = await _start_control_server(
+            settings.STATE_DIR, self.launch_url.partition("#")[0]
+        )
         try:
             delivery = _deliver_launch_url(self.launch_url, no_browser=self.no_browser)
         except SystemExit as exc:
@@ -221,11 +349,26 @@ class _LaunchServer(uvicorn.Server):
             self.started = False
             return
         if delivery == "browser":
-            print("  auth : one-time launch URL sent directly to the browser\n")
+            print(
+                "  auth : paste the launch URL shown on this terminal into the "
+                "sign-in page that just opened, or open that URL directly"
+            )
         else:
             print(
-                "  auth : one-time launch URL shown only on the controlling terminal\n"
+                "  auth : open the one-time launch URL shown on this terminal in "
+                "a browser on this machine"
             )
+        if self.control_server is not None:
+            print("  later: `omicsang open` prints a fresh launch URL\n")
+
+    async def shutdown(self, sockets=None) -> None:
+        if self.control_server is not None:
+            from . import settings
+
+            self.control_server.close()
+            self.control_server = None
+            _control_socket_path(settings.STATE_DIR).unlink(missing_ok=True)
+        await super().shutdown(sockets=sockets)
 
 
 def _run_server(
@@ -300,6 +443,11 @@ def main() -> None:
             raise SystemExit("error: --clear-state requires --yes")
         settings.clear_state(confirmed=True)
         print(f"Cleared OmicsANG state: {settings.STATE_DIR}")
+        return
+
+    if args.command == "open":
+        _write_launch_url_to_tty(_request_launch_url(settings.STATE_DIR))
+        print("One-time launch URL written to this terminal; it expires in 5 minutes.")
         return
 
     display_host = f"[{host}]" if ":" in host else host
