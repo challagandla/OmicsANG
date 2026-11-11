@@ -18,6 +18,15 @@ an unprivileged mount namespace around the agent process:
     bound back in;
   * sibling pipelines are never materialised into the namespace at all.
 
+  * within the provider's configuration directory, everything the CLI later
+    *executes or loads as instructions* (settings, hooks, plugins, skills,
+    commands, global memory) is read-only, other projects' transcripts and
+    caches are replaced by empty scratch space, and the mixed state/MCP file
+    is a private copy that is never written back;
+  * unix-domain sockets cannot be created, so the desktop session's X11 and
+    D-Bus sockets, which live in the shared network namespace and would accept
+    this uid, are out of reach.
+
 Two deliberate non-goals:
 
   * **Network egress is not restricted.**  Agent CLIs must reach their provider
@@ -25,7 +34,8 @@ Two deliberate non-goals:
     exfiltration.  Domain-level control belongs to each CLI's own sandbox
     configuration (see `docs/agent-sandbox.md`); this layer is about the
     filesystem.  The SECURITY.md note that provider tools may transmit
-    repository content still holds in full.
+    repository content still holds in full.  The network namespace is shared,
+    so TCP services listening on this machine's loopback are reachable too.
   * **The provider's own credentials remain reachable**, because the CLI cannot
     authenticate without them.  Containment protects everything *else*.
 
@@ -35,9 +45,14 @@ file it cannot be edited or disabled by the agent it constrains.
 
 from __future__ import annotations
 
+import errno
 import functools
 import os
+import platform
+import re
 import shutil
+import stat
+import struct
 import subprocess
 from pathlib import Path
 
@@ -60,7 +75,9 @@ def mode() -> str:
     raw = (
         str(environment_value("AGENT_SANDBOX", MODE_AUTO) or MODE_AUTO).strip().lower()
     )
-    return raw if raw in MODES else MODE_AUTO
+    # A value that is set but not understood (for example "required") was
+    # meant to ask for something; refusing to run uncontained is the safe reading.
+    return raw if raw in MODES else MODE_REQUIRE
 
 
 def _env_roots(suffix: str) -> tuple[Path, ...]:
@@ -98,60 +115,314 @@ def _home() -> Path:
         return Path("/nonexistent")
 
 
-def _tool_config_paths(tool: str) -> tuple[list[Path], list[Path]]:
-    """Return (writable, read-only) paths for one provider's own configuration.
+def _private_dir() -> Path | None:
+    """Private scratch space for per-launch copies and the socket filter."""
+    from . import settings
 
-    Mirrors the per-tool split in `sessions._AGENT_PROVIDER_ENV`: a Claude
-    session is not given Codex's credentials, and vice versa.  Config dirs are
-    writable because both CLIs persist session and auth state as they run.
-    """
+    path = settings.STATE_DIR / "agent-sandbox"
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
+    except OSError:
+        return None
+    return path
+
+
+def _write_private(name: str, data: bytes) -> Path | None:
+    directory = _private_dir()
+    if directory is None:
+        return None
+    target = directory / name
+    try:
+        fd = os.open(
+            target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+    return target
+
+
+# What each CLI later executes, or loads as instructions, from its own config
+# directory.  A contained agent that could write these would run code or steer
+# the operator's next *uncontained* session, so they are mounted read-only.
+_PROVIDER_READONLY = {
+    "claude": (
+        "settings.json",
+        "settings.local.json",
+        "CLAUDE.md",
+        "keybindings.json",
+        "hooks",
+        "commands",
+        "agents",
+        "skills",
+        "plugins",
+        "output-styles",
+        "rules",
+        "local",
+    ),
+    "codex": (
+        "config.toml",
+        "AGENTS.md",
+        "hooks",
+        "plugins",
+        "packages",
+        "prompts",
+        "skills",
+        "rules",
+    ),
+}
+# A name that does not exist yet cannot be mounted read-only, and the agent
+# could simply create it.  These inert placeholders close that gap; an empty
+# file or directory changes nothing about how the CLI behaves.
+_PROVIDER_PLACEHOLDER_FILES = {
+    "claude": {"settings.json": "{}\n", "CLAUDE.md": ""},
+    "codex": {"config.toml": "", "AGENTS.md": ""},
+}
+_PROVIDER_PLACEHOLDER_DIRS = {
+    "claude": ("plugins", "skills", "commands", "agents", "rules", "output-styles"),
+    "codex": ("plugins", "prompts", "skills"),
+}
+# Mixed files: live state the CLI rewrites constantly, plus settings (MCP server
+# commands) that would execute outside the sandbox.  The agent gets a private
+# copy that is refreshed from the real file at every launch and never copied back.
+_PROVIDER_PRIVATE_COPIES = {"claude": (".claude.json",), "codex": ()}
+# Cross-project prompt history; replaced by an empty private file.
+_PROVIDER_SCRATCH_FILES = ("history.jsonl",)
+
+
+def _provider_config_dir(tool: str) -> Path | None:
     home = _home()
-    writable: list[Path] = []
-    readonly: list[Path] = []
     if tool == "claude":
         config = os.environ.get("CLAUDE_CONFIG_DIR")
-        writable.append(Path(config).expanduser() if config else home / ".claude")
-        writable.append(home / ".claude.json")
+        return Path(config).expanduser() if config else home / ".claude"
+    if tool == "codex":
+        config = os.environ.get("CODEX_HOME")
+        return Path(config).expanduser() if config else home / ".codex"
+    return None
+
+
+def _ensure_placeholders(tool: str, config: Path) -> None:
+    for name, content in _PROVIDER_PLACEHOLDER_FILES.get(tool, {}).items():
+        try:
+            fd = os.open(
+                config / name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError:
+            continue
+        try:
+            os.write(fd, content.encode("utf-8"))
+        finally:
+            os.close(fd)
+    for name in _PROVIDER_PLACEHOLDER_DIRS.get(tool, ()):
+        try:
+            os.mkdir(config / name, 0o700)
+        except OSError:
+            continue
+
+
+def _claude_project_dir(config: Path, workdir: Path) -> Path | None:
+    """The one transcript directory this session may see and resume from."""
+    projects = config / "projects"
+    target = projects / re.sub(r"[^A-Za-z0-9]", "-", str(workdir))
+    try:
+        if projects.is_symlink():
+            return None
+        projects.mkdir(mode=0o700, exist_ok=True)
+        if target.is_symlink():
+            return None
+        target.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    return target
+
+
+def _private_copy_bind(tool: str, source: Path) -> list[str]:
+    """Bind a throwaway copy of `source` over itself; read-only if that fails."""
+    try:
+        data = source.read_bytes() if source.stat().st_size <= 64 << 20 else None
+    except OSError:
+        data = None
+    copy = _write_private(f"{tool}{source.name}", data) if data is not None else None
+    if copy is None:
+        return ["--ro-bind", str(source), str(source)]
+    return ["--bind", str(copy), str(source)]
+
+
+def _provider_config_args(tool: str, workdir: Path) -> list[str]:
+    """Mount one provider's configuration with only its live state writable.
+
+    Mirrors the per-tool split in `sessions._AGENT_PROVIDER_ENV`: a Claude
+    session is not given Codex's credentials, and vice versa.  The directory
+    itself stays writable because both CLIs replace their credential file as
+    tokens refresh; everything else is narrowed on top of that bind.
+    """
+    args: list[str] = []
+    home = _home()
+    if tool == "claude":
         # Versioned install payload; read-only so an agent cannot rewrite its
         # own binary and survive the next launch.
-        readonly.append(home / ".local" / "share" / "claude")
-    elif tool == "codex":
-        config = os.environ.get("CODEX_HOME")
-        writable.append(Path(config).expanduser() if config else home / ".codex")
-    return writable, readonly
+        payload = home / ".local" / "share" / "claude"
+        if payload.exists():
+            _bind(args, "--ro-bind-try", payload)
+    config = _provider_config_dir(tool)
+    if config is None:
+        return args
+    try:
+        config = config.resolve(strict=True)
+    except (OSError, RuntimeError):
+        config = None
+    private_copies = _PROVIDER_PRIVATE_COPIES.get(tool, ())
+    if config is not None and config.is_dir():
+        _bind(args, "--bind", config)
+        _ensure_placeholders(tool, config)
+        readonly = set(_PROVIDER_READONLY.get(tool, ()))
+        scratch = _write_private(f"{tool}-history.jsonl", b"")
+        try:
+            entries = sorted(os.scandir(config), key=lambda entry: entry.name)
+        except OSError:
+            entries = []
+        for entry in entries:
+            path = config / entry.name
+            if entry.is_symlink():
+                # A mount cannot be pinned onto a symlink; see docs/agent-sandbox.md.
+                continue
+            is_dir = entry.is_dir(follow_symlinks=False)
+            if entry.name in readonly or (
+                tool == "codex" and not is_dir and ".toml" in entry.name
+            ):
+                _bind(args, "--ro-bind", path)
+            elif entry.name in private_copies and not is_dir:
+                args.extend(_private_copy_bind(tool, path))
+            elif entry.name in _PROVIDER_SCRATCH_FILES and not is_dir and scratch:
+                args.extend(["--bind", str(scratch), str(path)])
+            elif is_dir:
+                # Caches, logs, IDE and daemon control sockets, and every other
+                # project's transcripts: present but empty and never persisted.
+                args.extend(["--tmpfs", str(path)])
+        if tool == "claude":
+            project = _claude_project_dir(config, workdir)
+            if project is not None:
+                _bind(args, "--bind", project)
+    if tool == "claude" and not os.environ.get("CLAUDE_CONFIG_DIR"):
+        for name in private_copies:
+            source = home / name
+            if source.is_file() and not source.is_symlink():
+                args.extend(_private_copy_bind(tool, source))
+    return args
+
+
+# --- unix-domain socket filter ---------------------------------------------
+_AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
+_SYSCALL_SOCKET = {"x86_64": 41, "aarch64": 198}
+_SYSCALL_IO_URING_SETUP = 425
+_SECCOMP_RET_ALLOW = 0x7FFF0000
+_SECCOMP_RET_ERRNO = 0x00050000
+_SOCKET_FILTER_FD = "9"
+
+
+def unix_sockets_allowed() -> bool:
+    raw = str(environment_value("AGENT_SANDBOX_UNIX_SOCKETS", "") or "")
+    return raw.strip().lower() == "allow"
+
+
+def _socket_filter_program(machine: str | None = None) -> bytes | None:
+    """Classic-BPF seccomp program that refuses ``socket(AF_UNIX, ...)``.
+
+    Abstract unix sockets belong to the network namespace, which stays shared
+    so the agent can reach its provider.  Desktop X11 and D-Bus listeners there
+    authenticate by peer uid, and the sandbox keeps the operator's uid, so the
+    only way to keep them out of reach is to deny the socket family.
+    ``socketpair`` is untouched; ``io_uring`` is refused because it can create
+    sockets without the ``socket`` system call.
+    """
+    machine = machine or platform.machine()
+    if machine not in _AUDIT_ARCH:
+        return None
+    ld_abs, jeq, jge, ret = 0x20, 0x15, 0x35, 0x06
+    deny = _SECCOMP_RET_ERRNO | errno.EPERM
+    unsupported = _SECCOMP_RET_ERRNO | errno.ENOSYS
+    program = [
+        (ld_abs, 0, 0, 4),  # seccomp_data.arch
+        (jeq, 1, 0, _AUDIT_ARCH[machine]),
+        (ret, 0, 0, deny),  # foreign ABI: its socket calls are numbered differently
+        (ld_abs, 0, 0, 0),  # seccomp_data.nr
+    ]
+    if machine == "x86_64":
+        program += [(jge, 0, 1, 0x40000000), (ret, 0, 0, unsupported)]  # x32 ABI
+    program += [
+        (jeq, 0, 1, _SYSCALL_IO_URING_SETUP),
+        (ret, 0, 0, unsupported),
+        (jeq, 0, 3, _SYSCALL_SOCKET[machine]),
+        (ld_abs, 0, 0, 16),  # low word of args[0]: the address family
+        (jeq, 0, 1, 1),  # AF_UNIX
+        (ret, 0, 0, deny),
+        (ret, 0, 0, _SECCOMP_RET_ALLOW),
+    ]
+    return b"".join(struct.pack("=HBBI", *instruction) for instruction in program)
+
+
+def _socket_filter_path() -> Path | None:
+    if unix_sockets_allowed():
+        return None
+    program = _socket_filter_program()
+    if program is None:
+        return None
+    return _write_private("deny-unix-sockets.bpf", program)
 
 
 def _git_common_dir(cwd: Path) -> Path | None:
-    """Resolve the real git directory backing `cwd`, if it is a linked worktree.
+    """Return the main repository's git directory for a genuine linked worktree.
 
     A linked worktree's `.git` is a file pointing into the main repository's
     `.git/worktrees/<name>`.  Without that path bound, every git operation in
     the worktree fails — which is exactly how OmicsANG's fleet and worktree
     launches run agents.
+
+    The working directory is writable by earlier agent sessions, so nothing in
+    it may choose what gets bound.  The pointer is therefore read without
+    running git, and accepted only when the main repository itself registers
+    this directory as one of its worktrees: an agent cannot write that
+    registration into a repository it was never given.
     """
+    pointer = cwd / ".git"
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        if not stat.S_ISREG(os.lstat(pointer).st_mode):
+            # A real directory is a main checkout (already inside the bind); a
+            # symlink is never followed.
+            return None
+        with open(pointer, encoding="utf-8") as handle:
+            text = handle.read(4096)
+    except (OSError, UnicodeDecodeError):
         return None
-    if result.returncode != 0:
+    first = text.splitlines()[0] if text else ""
+    if not first.startswith("gitdir:"):
         return None
-    raw = result.stdout.strip()
-    if not raw:
-        return None
-    candidate = Path(raw)
-    if not candidate.is_absolute():
-        candidate = cwd / candidate
+    admin = Path(first[len("gitdir:") :].strip())
+    if not admin.is_absolute():
+        admin = cwd / admin
     try:
-        return candidate.resolve(strict=True)
-    except (OSError, RuntimeError):
+        admin = admin.resolve(strict=True)
+        common = admin.parent.parent
+        if admin.parent.name != "worktrees" or common.name != ".git":
+            return None
+        if not stat.S_ISDIR(os.lstat(common).st_mode):
+            return None
+        registered = (admin / "gitdir").read_text(encoding="utf-8").strip()
+        if Path(registered).resolve(strict=True) != pointer.resolve(strict=True):
+            return None
+        shared = (admin / "commondir").read_text(encoding="utf-8").strip()
+        if (admin / shared).resolve(strict=True) != common:
+            return None
+    except (OSError, RuntimeError, UnicodeDecodeError):
         return None
+    return common
 
 
 @functools.lru_cache(maxsize=1)
@@ -255,13 +526,7 @@ def build_argv(argv: list[str], *, cwd: str, tool: str) -> list[str]:
     # $HOME as tmpfs: dotfiles and credentials are absent, not merely denied.
     args.extend(["--tmpfs", str(home)])
 
-    writable, readonly = _tool_config_paths(tool)
-    for path in readonly:
-        if path.exists():
-            _bind(args, "--ro-bind-try", path)
-    for path in writable:
-        if path.exists():
-            _bind(args, "--bind-try", path)
+    args.extend(_provider_config_args(tool, workdir))
 
     # The launcher and its resolved target, read-only.  Callers may pass a bare
     # command name, and $HOME is a tmpfs here: without an explicit bind, a CLI
@@ -291,10 +556,18 @@ def build_argv(argv: list[str], *, cwd: str, tool: str) -> list[str]:
             "--die-with-parent",
             "--chdir",
             str(workdir),
-            "--",
         ]
     )
-    return args + list(argv)
+    socket_filter = _socket_filter_path()
+    if socket_filter is not None:
+        args.extend(["--seccomp", _SOCKET_FILTER_FD])
+    wrapped = args + ["--", *argv]
+    if socket_filter is None:
+        return wrapped
+    # bubblewrap takes the compiled filter on an inherited descriptor, so a
+    # fixed shell line opens it and then replaces itself with bubblewrap.
+    opener = f'exec {_SOCKET_FILTER_FD}<"$0" && exec "$@"'
+    return ["/bin/sh", "-c", opener, str(socket_filter), *wrapped]
 
 
 def _within(target: Path, root: Path) -> bool:
@@ -305,7 +578,14 @@ def describe(cwd: str, tool: str) -> str:
     """One-line summary for the session scrollback, so the boundary is visible."""
     extra_read = len(read_roots())
     extra_write = len(write_roots())
-    detail = f"repo {cwd} writable; $HOME hidden except {tool} config"
+    detail = (
+        f"repo {cwd} writable; $HOME hidden except {tool} state "
+        "(its settings, hooks and plugins are read-only)"
+    )
     if extra_read or extra_write:
         detail += f"; +{extra_read} read / +{extra_write} write roots"
-    return f"OmicsANG: agent contained (bubblewrap) — {detail}; network unrestricted"
+    sockets = "allowed" if unix_sockets_allowed() else "blocked"
+    return (
+        f"OmicsANG: agent contained (bubblewrap) — {detail}; "
+        f"unix sockets {sockets}; network unrestricted"
+    )

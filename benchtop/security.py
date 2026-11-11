@@ -21,8 +21,15 @@ from typing import Awaitable, Callable
 
 AUTH_COOKIE = "benchtop_session"
 CSRF_HEADER = "x-benchtop-csrf"
+# Browsers cannot set headers on a WebSocket upgrade, so the page presents its
+# secret as an offered subprotocol and the server selects the fixed one.
+WS_SUBPROTOCOL = "omicsang.term.v1"
+WS_SECRET_PREFIX = "omicsang.csrf."  # pragma: allowlist secret
 MAX_REQUEST_BYTES = 2_000_000
 SESSION_TTL_SECONDS = 12 * 60 * 60
+# Extra one-time launch codes minted for the running server by `omicsang open`.
+LAUNCH_CODE_TTL_SECONDS = 5 * 60
+MAX_PENDING_LAUNCH_CODES = 8
 ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -47,7 +54,25 @@ class AuthState:
             self._bootstrap_token = bootstrap_token or secrets.token_urlsafe(48)
             self._bootstrap_used = False
             self._sessions = {}
+            self._issued: dict[str, float] = {}
             return self._bootstrap_token
+
+    def issue_launch_code(self) -> str:
+        """Mint another short-lived, single-use launch capability.
+
+        Only the local control socket calls this, so the caller is already the
+        account that owns the server.
+        """
+        now = time.time()
+        with self._lock:
+            self._issued = {
+                code: expires for code, expires in self._issued.items() if expires > now
+            }
+            while len(self._issued) >= MAX_PENDING_LAUNCH_CODES:
+                self._issued.pop(next(iter(self._issued)))
+            code = secrets.token_urlsafe(48)
+            self._issued[code] = now + LAUNCH_CODE_TTL_SECONDS
+            return code
 
     @property
     def bootstrap_token(self) -> str:
@@ -56,14 +81,23 @@ class AuthState:
     def exchange(self, candidate: str) -> BrowserSession | None:
         """Consume the launch capability exactly once and create a browser session."""
         now = time.time()
+        candidate = str(candidate or "")
         with self._lock:
-            if self._bootstrap_used or not secrets.compare_digest(
-                str(candidate or ""), self._bootstrap_token
-            ):
+            initial = not self._bootstrap_used and secrets.compare_digest(
+                candidate, self._bootstrap_token
+            )
+            issued = ""
+            for code, expires in self._issued.items():
+                if secrets.compare_digest(candidate, code) and expires > now:
+                    issued = code
+            if not initial and not issued:
                 return None
-            self._bootstrap_used = True
-            # Remove the usable bootstrap value immediately after comparison.
-            self._bootstrap_token = secrets.token_urlsafe(48)
+            if initial:
+                self._bootstrap_used = True
+                # Remove the usable bootstrap value immediately after comparison.
+                self._bootstrap_token = secrets.token_urlsafe(48)
+            else:
+                del self._issued[issued]
             token = secrets.token_urlsafe(48)
             session = BrowserSession(
                 token=token,
@@ -251,6 +285,18 @@ class SecurityMiddleware:
                     }
                 )
                 return
+            # The cookie is ambient: a browser sends it to every port on this
+            # host.  Only the page that completed the launch exchange holds
+            # the second secret, so the cookie alone never opens a terminal.
+            if not websocket_secret_matches(scope, session):
+                await send(
+                    {
+                        "type": "websocket.close",
+                        "code": 4403,
+                        "reason": "valid page secret required",
+                    }
+                )
+                return
             scope.setdefault("state", {})["benchtop_session"] = session
             await self.app(scope, receive, send)
             return
@@ -265,7 +311,6 @@ class SecurityMiddleware:
         session: BrowserSession | None = None
         is_api = path == "/api" or path.startswith("/api/")
         is_bootstrap = path == "/api/auth/bootstrap"
-        is_session_recovery = path == "/api/auth/session"
         if is_api:
             if is_bootstrap:
                 if method != "POST":
@@ -279,11 +324,12 @@ class SecurityMiddleware:
                 if not session:
                     await _json_rejection(send, 401, "authentication required")
                     return
-                if not is_session_recovery:
-                    csrf = headers.get(CSRF_HEADER, "")
-                    if not csrf or not secrets.compare_digest(csrf, session.csrf):
-                        await _json_rejection(send, 403, "valid CSRF token required")
-                        return
+                # No exception: the cookie reaches every local port, so it must
+                # never be enough to obtain the page secret or call the API.
+                csrf = headers.get(CSRF_HEADER, "")
+                if not csrf or not secrets.compare_digest(csrf, session.csrf):
+                    await _json_rejection(send, 403, "valid CSRF token required")
+                    return
                 if method in {"POST", "PUT", "PATCH", "DELETE"}:
                     if not same_origin(scope, headers):
                         await _json_rejection(send, 403, "same-origin request required")
@@ -310,7 +356,10 @@ class SecurityMiddleware:
             async def replay_body() -> dict:
                 nonlocal delivered
                 if delivered:
-                    return {"type": "http.disconnect"}
+                    # Wait for the real disconnect.  Reporting one immediately
+                    # makes a file or streaming response believe the client
+                    # left and abandon its body.
+                    return await receive()
                 delivered = True
                 return {"type": "http.request", "body": bytes(body), "more_body": False}
 
@@ -329,6 +378,18 @@ class SecurityMiddleware:
             await send(message)
 
         await self.app(scope, guarded_receive, guarded_send)
+
+
+def websocket_secret_matches(scope: dict, session: BrowserSession) -> bool:
+    """Check the page secret offered as a WebSocket subprotocol."""
+    offered = [str(value) for value in scope.get("subprotocols") or []]
+    if WS_SUBPROTOCOL not in offered:
+        return False
+    for value in offered:
+        if value.startswith(WS_SECRET_PREFIX):
+            candidate = value[len(WS_SECRET_PREFIX) :]
+            return bool(candidate) and secrets.compare_digest(candidate, session.csrf)
+    return False
 
 
 def auth_cookie_header(session: BrowserSession) -> str:

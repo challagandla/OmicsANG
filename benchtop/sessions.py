@@ -39,6 +39,10 @@ from .runplan import redact_argv, redact_mapping
 
 # Sentinel pushed onto subscriber queues when a session ends.
 EOF = object()
+# Queued for a subscriber whose backlog overflowed: the consumer discards what
+# it has and repaints from the session's scrollback instead of silently
+# showing output with a hole in it.
+RESYNC = object()
 
 _MAX_BUFFER = 2_000_000  # bytes of scrollback retained in memory per session
 _MAX_SUBSCRIBERS = 8
@@ -230,6 +234,7 @@ class Session:
 
         self._buffer = bytearray()
         self._subscribers: set[asyncio.Queue] = set()
+        self.resyncs = 0
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._logf = None
         self._eof_done = False
@@ -344,7 +349,43 @@ class Session:
             try:
                 q.put_nowait(data)
             except asyncio.QueueFull:
-                pass  # slow client; it still has scrollback on reattach
+                self._request_resync(q)
+
+    def _request_resync(self, q: asyncio.Queue) -> None:
+        """Replace a slow consumer's backlog with one repaint request.
+
+        Dropping the chunk would leave an invisible gap in a run's output.  The
+        scrollback buffer still holds the recent stream (and the log file the
+        whole of it), so the consumer is told to repaint from that instead.
+        """
+        ended = False
+        while True:
+            try:
+                item = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            ended = ended or item is EOF
+        self.resyncs += 1
+        q.put_nowait(RESYNC)
+        if ended:
+            q.put_nowait(EOF)
+
+    def resync_snapshot(self, q: asyncio.Queue) -> bytes:
+        """Scrollback for a consumer handling RESYNC, with its backlog cleared.
+
+        Chunks queued after the request are already part of the scrollback, so
+        they are discarded here to avoid painting them twice.
+        """
+        ended = False
+        while True:
+            try:
+                item = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            ended = ended or item is EOF
+        if ended:
+            q.put_nowait(EOF)
+        return bytes(self._buffer)
 
     def _filter_initial_input_echo(self, data: bytes) -> bytes:
         """Remove only the terminal driver's leading echo of private input."""

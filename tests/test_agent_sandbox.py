@@ -20,6 +20,56 @@ from unittest import mock
 
 from benchtop import sandbox, sessions
 
+_FIXTURE: dict = {}
+
+
+def setUpModule() -> None:
+    """Point the sandbox at a throwaway home and state directory.
+
+    Building a wrapper creates inert placeholders in the provider's config
+    directory, which must never touch the developer's real one.
+    """
+    tmp = tempfile.TemporaryDirectory()
+    home = Path(tmp.name).resolve() / "home"
+    private = Path(tmp.name).resolve() / "private"
+    claude = home / ".claude"
+    (claude / "projects" / "-some-other-project").mkdir(parents=True)
+    (claude / "projects" / "-some-other-project" / "t.jsonl").write_text("other\n")
+    (claude / "ide").mkdir()
+    (claude / "ide" / "1234.lock").write_text("ide-token\n")
+    (claude / "skills").mkdir()
+    (claude / "settings.json").write_text('{"hooks": {}}\n')
+    (claude / ".credentials.json").write_text("{}\n")
+    (claude / "history.jsonl").write_text("prompt from another project\n")
+    (home / ".claude.json").write_text('{"mcpServers": {}}\n')
+    codex = home / ".codex"
+    (codex / "log").mkdir(parents=True)
+    (codex / "auth.json").write_text("{}\n")
+    (codex / "config.toml").write_text("")
+    (codex / "openai.config.toml").write_text("")
+    private.mkdir(mode=0o700)
+    patches = [
+        mock.patch.object(sandbox, "_home", return_value=home),
+        mock.patch.object(sandbox, "_private_dir", return_value=private),
+        mock.patch.dict(os.environ),
+    ]
+    for patch in patches:
+        patch.start()
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        os.environ.pop(name, None)
+    _FIXTURE.update(tmp=tmp, home=home, private=private, patches=patches)
+
+
+def tearDownModule() -> None:
+    for patch in reversed(_FIXTURE["patches"]):
+        patch.stop()
+    _FIXTURE["tmp"].cleanup()
+
+
+def _bwrap_args(argv: list[str]) -> list[str]:
+    """Drop the fixed shell prefix that opens the socket filter, if present."""
+    return argv[argv.index(sandbox.BWRAP) :]
+
 
 def _sandbox_usable() -> bool:
     sandbox.available.cache_clear()
@@ -35,8 +85,10 @@ class ModeTests(unittest.TestCase):
             os.environ.pop("OMICSANG_AGENT_SANDBOX", None)
             os.environ.pop("BENCHTOP_AGENT_SANDBOX", None)
             self.assertEqual(sandbox.mode(), sandbox.MODE_AUTO)
-        with mock.patch.dict(os.environ, {"OMICSANG_AGENT_SANDBOX": "banana"}):
-            self.assertEqual(sandbox.mode(), sandbox.MODE_AUTO)
+        # An unrecognised value must never degrade to an uncontained launch.
+        for value in ("banana", "required", "on", "1", "strict"):
+            with mock.patch.dict(os.environ, {"OMICSANG_AGENT_SANDBOX": value}):
+                self.assertEqual(sandbox.mode(), sandbox.MODE_REQUIRE)
         with mock.patch.dict(os.environ, {"OMICSANG_AGENT_SANDBOX": "REQUIRE"}):
             self.assertEqual(sandbox.mode(), sandbox.MODE_REQUIRE)
 
@@ -126,7 +178,7 @@ class BuildArgvTests(unittest.TestCase):
 
     def test_home_is_replaced_by_a_tmpfs(self) -> None:
         argv = self._argv()
-        home = str(Path(os.path.expanduser("~")).resolve())
+        home = str(sandbox._home())
         self.assertEqual(
             argv[argv.index("--tmpfs") : argv.index("--tmpfs") + 2][0], "--tmpfs"
         )
@@ -142,8 +194,22 @@ class BuildArgvTests(unittest.TestCase):
 
     def test_command_is_separated_from_wrapper_flags(self) -> None:
         argv = self._argv()
-        self.assertEqual(argv[0], sandbox.BWRAP)
+        self.assertEqual(_bwrap_args(argv)[0], sandbox.BWRAP)
         self.assertEqual(argv[-2:], ["--", "/bin/true"])
+
+    def test_socket_filter_is_opened_by_a_fixed_prefix(self) -> None:
+        argv = self._argv()
+        self.assertEqual(argv[:2], ["/bin/sh", "-c"])
+        self.assertEqual(argv[2], 'exec 9<"$0" && exec "$@"')
+        self.assertTrue(Path(argv[3]).is_file())
+        self.assertEqual(argv[4], sandbox.BWRAP)
+        self.assertEqual(argv[argv.index("--seccomp") + 1], "9")
+        with mock.patch.dict(
+            os.environ, {"OMICSANG_AGENT_SANDBOX_UNIX_SOCKETS": "allow"}
+        ):
+            allowed = self._argv()
+        self.assertEqual(allowed[0], sandbox.BWRAP)
+        self.assertNotIn("--seccomp", allowed)
 
     def test_network_is_not_unshared(self) -> None:
         # Agents must reach their provider; egress control is the CLI's job.
@@ -171,6 +237,183 @@ class BuildArgvTests(unittest.TestCase):
     def test_empty_command_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             sandbox.build_argv([], cwd=str(self.repo), tool="claude")
+
+
+@unittest.skipUnless(_sandbox_usable(), "bubblewrap sandbox unavailable")
+class ProviderConfigTests(unittest.TestCase):
+    """Only the provider's live state is writable; what it executes is not."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name).resolve()
+        self.home = _FIXTURE["home"]
+
+    def _mounts(self, tool: str) -> dict[str, tuple[str, str]]:
+        argv = sandbox.build_argv(["/bin/true"], cwd=str(self.repo), tool=tool)
+        mounts: dict[str, tuple[str, str]] = {}
+        index = 0
+        while index < len(argv):
+            flag = argv[index]
+            if flag in {"--bind", "--ro-bind", "--bind-try", "--ro-bind-try"}:
+                mounts[argv[index + 2]] = (flag, argv[index + 1])
+                index += 3
+            elif flag == "--tmpfs":
+                mounts[argv[index + 1]] = (flag, "")
+                index += 2
+            else:
+                index += 1
+        return mounts
+
+    def test_claude_settings_and_loaded_content_are_read_only(self) -> None:
+        mounts = self._mounts("claude")
+        claude = self.home / ".claude"
+        self.assertEqual(mounts[str(claude)][0], "--bind")
+        for name in ("settings.json", "CLAUDE.md", "skills", "plugins", "commands"):
+            with self.subTest(name=name):
+                self.assertEqual(mounts[str(claude / name)][0], "--ro-bind")
+
+    def test_missing_executable_settings_get_inert_placeholders(self) -> None:
+        self._mounts("claude")
+        claude = self.home / ".claude"
+        self.assertEqual((claude / "CLAUDE.md").read_text(), "")
+        self.assertTrue((claude / "plugins").is_dir())
+        self.assertEqual(list((claude / "plugins").iterdir()), [])
+        # An existing file is never overwritten by a placeholder.
+        self.assertEqual((claude / "settings.json").read_text(), '{"hooks": {}}\n')
+
+    def test_other_projects_and_control_state_are_replaced_by_scratch(self) -> None:
+        mounts = self._mounts("claude")
+        claude = self.home / ".claude"
+        self.assertEqual(mounts[str(claude / "projects")][0], "--tmpfs")
+        self.assertEqual(mounts[str(claude / "ide")][0], "--tmpfs")
+        self.assertNotIn(str(claude / "projects" / "-some-other-project"), mounts)
+        own = claude / "projects" / str(self.repo).replace("/", "-").replace("_", "-")
+        self.assertEqual(mounts[str(own)], ("--bind", str(own)))
+        history = mounts[str(claude / "history.jsonl")]
+        self.assertEqual(history[0], "--bind")
+        self.assertTrue(history[1].startswith(str(_FIXTURE["private"])))
+
+    def test_mixed_state_file_is_a_private_copy(self) -> None:
+        flag, source = self._mounts("claude")[str(self.home / ".claude.json")]
+        self.assertEqual(flag, "--bind")
+        self.assertTrue(source.startswith(str(_FIXTURE["private"])))
+        self.assertEqual(Path(source).read_text(), '{"mcpServers": {}}\n')
+        self.assertEqual(os.stat(source).st_mode & 0o777, 0o600)
+
+    def test_codex_configuration_files_are_read_only(self) -> None:
+        mounts = self._mounts("codex")
+        codex = self.home / ".codex"
+        self.assertEqual(mounts[str(codex)][0], "--bind")
+        for name in ("config.toml", "openai.config.toml", "AGENTS.md", "plugins"):
+            with self.subTest(name=name):
+                self.assertEqual(mounts[str(codex / name)][0], "--ro-bind")
+        self.assertEqual(mounts[str(codex / "log")][0], "--tmpfs")
+        self.assertNotIn(str(codex / "auth.json"), mounts)
+
+    def test_symlinked_entries_are_never_used_as_mount_points(self) -> None:
+        link = self.home / ".claude" / "rules"
+        if link.is_dir() and not link.is_symlink():
+            link.rmdir()
+        link.symlink_to(self.repo)
+        self.addCleanup(link.unlink)
+        self.assertNotIn(str(link), self._mounts("claude"))
+
+
+class SocketFilterProgramTests(unittest.TestCase):
+    def test_program_shape(self) -> None:
+        for machine, length in (("x86_64", 13), ("aarch64", 11)):
+            with self.subTest(machine=machine):
+                program = sandbox._socket_filter_program(machine)
+                self.assertEqual(len(program), length * 8)
+        self.assertIsNone(sandbox._socket_filter_program("riscv64"))
+
+
+@unittest.skipUnless(shutil.which("git"), "git is required")
+class GitDirectoryBindingTests(unittest.TestCase):
+    """Only a worktree the main repository itself registered may add a bind."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+        self.main = self._repo("main")
+        self.sibling = self._repo("sibling")
+
+    def _git(self, cwd: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+        )
+
+    def _repo(self, name: str) -> Path:
+        repo = self.root / name
+        repo.mkdir()
+        self._git(repo, "init", "-q", "-b", "main")
+        (repo / "f").write_text("1\n", encoding="utf-8")
+        self._git(repo, "add", ".")
+        self._git(repo, "commit", "-qm", "one")
+        return repo
+
+    def _extra_binds(self, workdir: Path) -> list[str]:
+        if not _sandbox_usable():
+            self.skipTest("bubblewrap sandbox unavailable")
+        argv = sandbox.build_argv(["/bin/true"], cwd=str(workdir), tool="claude")
+        # Provider-config binds live under the fixture home, not this root.
+        return [
+            argv[i + 1]
+            for i, flag in enumerate(argv)
+            if flag == "--bind"
+            and argv[i + 1] != str(workdir)
+            and argv[i + 1].startswith(str(self.root))
+        ]
+
+    def test_main_checkout_adds_no_git_bind(self) -> None:
+        self.assertIsNone(sandbox._git_common_dir(self.main))
+
+    def test_registered_worktree_binds_its_own_repository(self) -> None:
+        worktree = self.root / "wt"
+        self._git(self.main, "worktree", "add", "-q", "-b", "side", str(worktree))
+        self.assertEqual(sandbox._git_common_dir(worktree), self.main / ".git")
+        self.assertEqual(self._extra_binds(worktree), [str(self.main / ".git")])
+
+    def test_symlinked_git_directory_is_not_followed(self) -> None:
+        shutil.rmtree(self.main / ".git")
+        (self.main / ".git").symlink_to(self.sibling / ".git")
+        self.assertIsNone(sandbox._git_common_dir(self.main))
+        self.assertEqual(self._extra_binds(self.main), [])
+
+    def test_forged_gitdir_pointer_cannot_bind_a_sibling(self) -> None:
+        shutil.rmtree(self.main / ".git")
+        (self.main / ".git").write_text(
+            f"gitdir: {self.sibling / '.git'}\n", encoding="utf-8"
+        )
+        self.assertIsNone(sandbox._git_common_dir(self.main))
+        self.assertEqual(self._extra_binds(self.main), [])
+
+    def test_forged_commondir_cannot_bind_a_sibling(self) -> None:
+        # The agent owns its repository, so it can fabricate worktree metadata
+        # there whose commondir names another repository.
+        fake = self.main / ".git" / "worktrees" / "fake"
+        fake.mkdir(parents=True)
+        (fake / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (fake / "commondir").write_text(f"{self.sibling / '.git'}\n", encoding="utf-8")
+        victim = self.root / "victim"
+        victim.mkdir()
+        (victim / ".git").write_text(f"gitdir: {fake}\n", encoding="utf-8")
+        (fake / "gitdir").write_text(f"{victim / '.git'}\n", encoding="utf-8")
+        self.assertIsNone(sandbox._git_common_dir(victim))
+        self.assertNotIn(str(self.sibling / ".git"), self._extra_binds(victim))
+
+    def test_unregistered_pointer_into_sibling_worktrees_is_rejected(self) -> None:
+        other = self.root / "other-wt"
+        self._git(self.sibling, "worktree", "add", "-q", "-b", "side", str(other))
+        admin = self.sibling / ".git" / "worktrees" / "other-wt"
+        shutil.rmtree(self.main / ".git")
+        (self.main / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+        self.assertIsNone(sandbox._git_common_dir(self.main))
 
 
 @unittest.skipUnless(_sandbox_usable(), "bubblewrap sandbox unavailable")
@@ -206,6 +449,77 @@ class RealContainmentTests(unittest.TestCase):
     def test_home_secrets_are_absent(self) -> None:
         out = self._run("ls ~/.ssh >/dev/null 2>&1 && echo LEAKED || echo ABSENT")
         self.assertEqual(out, "ABSENT")
+
+    def test_provider_settings_cannot_be_modified_or_created(self) -> None:
+        claude = _FIXTURE["home"] / ".claude"
+        script = (
+            f"echo x >> {claude}/settings.json 2>/dev/null && echo W1;"
+            f"echo x > {claude}/plugins/evil 2>/dev/null && echo W2;"
+            f"rm -rf {claude}/skills 2>/dev/null && echo W3;"
+            f"mv {claude}/settings.json {claude}/s2 2>/dev/null && echo W4;"
+            "echo DONE"
+        )
+        self.assertEqual(self._run(script), "DONE")
+        self.assertEqual((claude / "settings.json").read_text(), '{"hooks": {}}\n')
+        self.assertTrue((claude / "skills").is_dir())
+
+    def test_credentials_can_still_be_replaced_atomically(self) -> None:
+        claude = _FIXTURE["home"] / ".claude"
+        script = (
+            f"echo new > {claude}/.credentials.json.tmp && "
+            f"mv {claude}/.credentials.json.tmp {claude}/.credentials.json && echo OK"
+        )
+        self.assertEqual(self._run(script), "OK")
+        self.assertEqual((claude / ".credentials.json").read_text(), "new\n")
+        (claude / ".credentials.json").write_text("{}\n")
+
+    def test_other_projects_history_and_ide_state_are_absent(self) -> None:
+        claude = _FIXTURE["home"] / ".claude"
+        script = (
+            f"ls {claude}/projects/-some-other-project 2>/dev/null && echo LEAK1;"
+            f"cat {claude}/ide/1234.lock 2>/dev/null && echo LEAK2;"
+            f"cat {claude}/history.jsonl; echo DONE"
+        )
+        self.assertEqual(self._run(script), "DONE")
+
+    def test_own_project_transcripts_persist(self) -> None:
+        claude = _FIXTURE["home"] / ".claude"
+        slug = str(self.repo).replace("/", "-").replace("_", "-")
+        script = f"echo t > {claude}/projects/{slug}/session.jsonl && echo OK"
+        self.assertEqual(self._run(script), "OK")
+        self.assertEqual(
+            (claude / "projects" / slug / "session.jsonl").read_text(), "t\n"
+        )
+
+    def test_mixed_state_file_changes_never_reach_the_real_file(self) -> None:
+        real = _FIXTURE["home"] / ".claude.json"
+        script = f'echo \'{{"mcpServers":{{"x":1}}}}\' > {real} && cat {real}'
+        self.assertIn('"x"', self._run(script))
+        self.assertEqual(real.read_text(), '{"mcpServers": {}}\n')
+
+    def test_unix_domain_sockets_are_refused_but_network_sockets_work(self) -> None:
+        probe = (
+            "import socket\n"
+            "def attempt(label, make):\n"
+            "    try:\n"
+            "        make(); print(label, 'ok')\n"
+            "    except OSError as exc:\n"
+            "        print(label, type(exc).__name__)\n"
+            "attempt('unix', lambda: socket.socket(socket.AF_UNIX))\n"
+            "attempt('inet', lambda: socket.socket(socket.AF_INET))\n"
+            "attempt('pair', lambda: socket.socketpair())\n"
+        )
+        (self.repo / "probe.py").write_text(probe, encoding="utf-8")
+        out = self._run("/usr/bin/python3 probe.py")
+        self.assertEqual(
+            out.splitlines(), ["unix PermissionError", "inet ok", "pair ok"]
+        )
+        with mock.patch.dict(
+            os.environ, {"OMICSANG_AGENT_SANDBOX_UNIX_SOCKETS": "allow"}
+        ):
+            self.assertEqual(
+                self._run("/usr/bin/python3 probe.py").splitlines()[0], "unix ok"
+            )
 
     def test_extra_read_root_is_honoured_read_only(self) -> None:
         with mock.patch.object(sandbox, "read_roots", return_value=(self.outside,)):

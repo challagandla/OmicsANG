@@ -28,6 +28,9 @@ commitment is made by this document.
 
 ## Operational precautions
 
+- Open the one-time launch URL only from the terminal that printed it. OmicsANG never passes it to another process, because command lines are readable by every local account.
+- The session cookie is not sufficient on its own. Every API request and every terminal WebSocket also needs a page secret that the browser keeps in `sessionStorage` for that exact origin and tab; other tabs of the same origin obtain it over a same-origin `BroadcastChannel`. A tab that cannot obtain it must be opened from a fresh launch URL after a restart.
+- An external agent shares the host's network namespace. It cannot open unix-domain sockets, but it can reach TCP services listening on loopback; do not run unauthenticated local services beside an agent you do not trust.
 - Launch OmicsANG only on a trusted machine and keep the generated launch URL private.
 - Review pipeline code before running it; OmicsANG does not isolate child processes.
 - Review every repository, worktree, prompt, and context category presented before approving external-agent access. Run-debug has a structured prompt preview; other launch surfaces may show a scope summary or truncated task rather than an exact complete payload.

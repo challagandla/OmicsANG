@@ -19,8 +19,8 @@ from typing import Any
 
 import yaml
 
+from . import git_ops, qc, results, runplan, settings, study, yaml_io
 from . import pipelines as pipeline_tools
-from . import qc, results, runplan, settings, study
 from .pipelines import Pipeline
 
 SCHEMA_VERSION = 1
@@ -219,6 +219,11 @@ def _sanitize_remote(value: str) -> str:
 
 
 def _git_command(root: Path, args: list[str], timeout: int = 8) -> str:
+    # Capsules snapshot checkouts an agent may have written to; never let the
+    # repository's own configuration choose what git executes.
+    env = git_ops.hardened_git_env(root)
+    if env is None:
+        return ""
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -226,6 +231,7 @@ def _git_command(root: Path, args: list[str], timeout: int = 8) -> str:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except Exception:
         return ""
@@ -359,7 +365,7 @@ def _config_snapshot(pipeline: Pipeline, launch: dict) -> dict:
     if path is None:
         return {"path": "", "digest": "", "values": {}}
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = yaml.safe_load(yaml_io.read_text(path))
         values = _flatten_config(data if data is not None else {})
         digest = _hash_file(path)["digest"]
     except Exception:

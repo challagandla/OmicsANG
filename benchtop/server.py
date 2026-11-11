@@ -9,6 +9,7 @@ import base64
 import csv
 import hashlib
 import json
+import mimetypes
 import os
 import pwd
 import re
@@ -31,7 +32,6 @@ from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
 
-import yaml
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -54,8 +54,9 @@ from . import (
     settings,
     store,
     study,
+    yaml_io,
 )
-from .sessions import EOF, Session, SessionManager
+from .sessions import EOF, RESYNC, Session, SessionManager
 
 app = FastAPI(
     title="OmicsANG",
@@ -324,12 +325,26 @@ def _safe_path(base: Path, rel: str) -> Path:
 
 
 ACTIVE_CONTENT_SUFFIXES = {".html", ".htm", ".svg", ".xhtml", ".xml"}
+# Media types a browser renders as a document in the application origin.
+ACTIVE_CONTENT_MEDIA_MARKERS = ("html", "xml", "svg")
+ACTIVE_CONTENT_MEDIA_TYPES = {"message/rfc822", "multipart/related"}
+
+
+def _is_active_content(target: Path) -> bool:
+    if target.suffix.casefold() in ACTIVE_CONTENT_SUFFIXES:
+        return True
+    # FileResponse derives its media type from the same guess, so suffixes
+    # such as .shtml, .xht, or .svgz must not slip past the suffix list.
+    media_type, encoding = mimetypes.guess_type(target.name)
+    media_type = (media_type or "").casefold()
+    return media_type in ACTIVE_CONTENT_MEDIA_TYPES or any(
+        marker in media_type for marker in ACTIVE_CONTENT_MEDIA_MARKERS
+    )
 
 
 def _authorized_file_response(target: Path) -> FileResponse:
     """Force active browser content to download outside the application origin."""
-    suffix = target.suffix.casefold()
-    if suffix in ACTIVE_CONTENT_SUFFIXES:
+    if _is_active_content(target):
         return FileResponse(
             str(target),
             media_type="application/octet-stream",
@@ -829,7 +844,9 @@ SHELL_RISK_PATTERNS = [
         "Review broad recursive deletion before running this workflow.",
     ),
     (
-        re.compile(r"\b(?:curl|wget)\b.+\|\s*(?:bash|sh)\b"),
+        # The gap is bounded so a long pipe-free line of repeated "curl" cannot
+        # make this scan quadratic in the line length.
+        re.compile(r"\b(?:curl|wget)\b.{1,400}\|\s*(?:bash|sh)\b"),
         "download piped to shell",
         "Install scripts piped directly to a shell are hard to audit and reproduce.",
     ),
@@ -913,7 +930,7 @@ def _iter_code_files(root: Path, limit: int = 500, *, scan: dict | None = None):
 
 def _read_utf8(path: Path) -> str | None:
     try:
-        return path.read_text(encoding="utf-8")
+        return yaml_io.read_text(path)
     except (OSError, UnicodeDecodeError):
         return None
 
@@ -1349,12 +1366,16 @@ print("\nOmicsANG SRA download complete.", flush=True)
     return script, config
 
 
+YAML_SCAN_NODE_LIMIT = 50_000
+YAML_SCAN_ITEM_LIMIT = 200
+
+
 def _scan_yaml_paths(root: Path, path: Path, rel: str, items: list[dict]) -> None:
     text = _read_utf8(path)
     if text is None:
         return
     try:
-        data = yaml.safe_load(text)
+        data = yaml_io.display_load(text)
     except Exception as exc:
         items.append(
             _diagnostic(
@@ -1368,7 +1389,14 @@ def _scan_yaml_paths(root: Path, path: Path, rel: str, items: list[dict]) -> Non
         )
         return
 
+    # YAML aliases are shared objects after loading, so a few hundred bytes of
+    # nested anchors can expand into billions of visits.  Bound the traversal.
+    budget = {"nodes": YAML_SCAN_NODE_LIMIT, "items": YAML_SCAN_ITEM_LIMIT}
+
     def walk(obj, key_path: str) -> None:
+        if budget["nodes"] <= 0 or budget["items"] <= 0:
+            return
+        budget["nodes"] -= 1
         if isinstance(obj, dict):
             for key, value in obj.items():
                 next_key = f"{key_path}.{key}" if key_path else str(key)
@@ -1379,6 +1407,7 @@ def _scan_yaml_paths(root: Path, path: Path, rel: str, items: list[dict]) -> Non
         elif isinstance(obj, str) and _looks_checkable_path(key_path, obj):
             if not _path_exists_for_config(root, path, obj):
                 line = _line_for_text(text, obj)
+                budget["items"] -= 1
                 items.append(
                     _diagnostic(
                         "warning",
@@ -1510,7 +1539,7 @@ def _scan_conda_env_yaml(path: Path, rel: str, items: list[dict]) -> None:
     if text is None:
         return
     try:
-        data = yaml.safe_load(text)
+        data = yaml_io.display_load(text)
     except Exception as exc:
         items.append(
             _diagnostic(
@@ -3320,16 +3349,16 @@ def bootstrap_browser(body: BootstrapRequest, response: Response):
 
 
 @app.get("/api/auth/session")
-def recover_browser_session(request: Request):
-    """Recover only the CSRF half of an authenticated browser session."""
+def check_browser_session(request: Request):
+    """Confirm that the page's stored secret still matches a live session.
+
+    The secret is never returned: a caller holding only the cookie is rejected
+    by the middleware before reaching this handler.
+    """
     browser_session = getattr(request.state, "benchtop_session", None)
     if not isinstance(browser_session, security.BrowserSession):
         raise HTTPException(401, "authentication required")
-    return {
-        "ok": True,
-        "csrf": browser_session.csrf,
-        "expires": browser_session.expires,
-    }
+    return {"ok": True, "expires": browser_session.expires}
 
 
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
@@ -7012,8 +7041,9 @@ def _require_agent_acknowledgement(tool: str, acknowledged: bool) -> None:
             )
         else:
             detail = (
-                "the agent runs as your OS account and OmicsANG does not add an OS "
-                "sandbox; repository context it reads may be sent to its provider"
+                "the agent runs as your OS account, filesystem-contained to this "
+                "repository only when the kernel allows it; repository context it "
+                "reads may be sent to its provider"
             )
         raise HTTPException(
             428,
@@ -7303,7 +7333,7 @@ async def kill_session(sid: str):
 # ---- websocket terminal --------------------------------------------------
 @app.websocket("/ws/term/{sid}")
 async def ws_term(ws: WebSocket, sid: str):
-    await ws.accept()
+    await ws.accept(subprotocol=security.WS_SUBPROTOCOL)
     s = mgr.get(sid)
     if not s:
         job = store.get_job(sid)
@@ -7356,6 +7386,15 @@ async def ws_term(ws: WebSocket, sid: str):
                     )
                 )
                 return
+            if item is RESYNC:
+                # This client fell too far behind.  Reset its terminal and
+                # repaint from scrollback so the view has no silent gap.
+                await ws.send_bytes(
+                    b"\x1bc\x1b[90m[OmicsANG: display fell behind and was "
+                    b"repainted from scrollback; the session log is complete]"
+                    b"\x1b[0m\r\n" + s.resync_snapshot(queue)
+                )
+                continue
             await ws.send_bytes(item)
 
     async def pump_in():
@@ -7612,8 +7651,23 @@ def _reconcile_recovered_local_cancellations() -> int:
     return reconciled
 
 
+_ORPHAN_CANDIDATE_STATES = (
+    "created",
+    "queued",
+    "preparing",
+    "running",
+    "cancel_requested",
+    "cancelling",
+)
+
+
 def _reconcile_orphaned_local_owners() -> int:
     """Fence dead controllers and make their queued/active jobs explicit."""
+    # Taking the lease is a durable write.  An idle installation has no local
+    # job that could be orphaned, so look before paying for it every tick; the
+    # authoritative listing below still happens under the lease.
+    if not store.list_jobs(executor="local", states=_ORPHAN_CANDIDATE_STATES, limit=1):
+        return 0
     owner = f"{INSTANCE_ID}:orphan-reconcile"
     token = store.acquire_lease(
         "controller:orphan-reconcile",
@@ -7627,14 +7681,7 @@ def _reconcile_orphaned_local_owners() -> int:
     try:
         jobs = store.list_jobs(
             executor="local",
-            states=(
-                "created",
-                "queued",
-                "preparing",
-                "running",
-                "cancel_requested",
-                "cancelling",
-            ),
+            states=_ORPHAN_CANDIDATE_STATES,
             limit=1000,
         )
         for job in jobs:
@@ -7699,8 +7746,10 @@ async def _controller_maintenance_loop() -> None:
     while True:
         await asyncio.sleep(5.0)
         try:
-            _renew_controller_heartbeat()
-            _renew_owned_session_leases()
+            # Lease renewals are durable (fsync'd) writes; on the event loop
+            # they would freeze every terminal and request for their duration.
+            await _await_blocking(_renew_controller_heartbeat)
+            await _await_blocking(_renew_owned_session_leases)
             _reconcile_orphaned_local_owners()
             _reconcile_recovered_local_cancellations()
             await _await_blocking(_retry_pending_local_finalizations)
@@ -7946,5 +7995,19 @@ def meta(summary: bool = False):
     }
 
 
+class _WebFiles(StaticFiles):
+    """Static UI whose entry page is always revalidated.
+
+    The page names its scripts with ``?v=`` cache-busters, so a browser that
+    reuses a heuristically cached page after an upgrade keeps the old assets.
+    """
+
+    def file_response(self, full_path, *args, **kwargs):
+        response = super().file_response(full_path, *args, **kwargs)
+        if Path(str(full_path)).name == "index.html":
+            response.headers["cache-control"] = "no-cache"
+        return response
+
+
 # static UI (mounted last so /api/* wins)
-app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+app.mount("/", _WebFiles(directory=str(WEB_DIR), html=True), name="web")

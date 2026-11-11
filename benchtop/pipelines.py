@@ -22,9 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import yaml
-
-from . import settings
+from . import settings, yaml_io
 
 
 @dataclass
@@ -62,7 +60,7 @@ class Pipeline:
 
 def _conda_env_name(env_file: Path) -> Optional[str]:
     try:
-        data = yaml.safe_load(env_file.read_text())
+        data = yaml_io.display_load(yaml_io.read_text(env_file))
         if isinstance(data, dict) and data.get("name"):
             return str(data["name"])
     except Exception:
@@ -72,7 +70,7 @@ def _conda_env_name(env_file: Path) -> Optional[str]:
 
 def _env_mentions_snakemake(env_file: Path) -> bool:
     try:
-        return "snakemake" in env_file.read_text().lower()
+        return "snakemake" in yaml_io.read_text(env_file).lower()
     except Exception:
         return False
 
